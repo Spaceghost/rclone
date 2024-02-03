@@ -545,8 +545,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// Check to see if the (bucket,directory) is actually an existing file
 		oldRoot := f.root
 		newRoot, leaf := path.Split(oldRoot)
+		fs.Errorf(nil, "newRoot, leaf = %q, %q", newRoot, leaf)
 		f.setRoot(newRoot)
 		_, err := f.NewObject(ctx, leaf)
+		fs.Errorf(nil, "err = %v", err)
 		if err != nil {
 			// File doesn't exist so return old f
 			f.setRoot(oldRoot)
