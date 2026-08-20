@@ -42,6 +42,14 @@ func TestMain(m *testing.M) {
 	fstest.TestMain(m)
 }
 
+func TestNewUpdateOpts(t *testing.T) {
+	o := &Object{fs: &Fs{opt: Options{Region: regionGlobal}}, id: "drive#item", etag: `"etag"`}
+	opts := o.newUpdateOpts(ctx, "POST", "/createUploadSession")
+	assert.Equal(t, graphAPIEndpoint[regionGlobal]+"/v1.0/drives", opts.RootURL)
+	assert.Equal(t, "/drive/items/item/createUploadSession", opts.Path)
+	assert.Equal(t, `"etag"`, opts.ExtraHeaders["If-Match"])
+}
+
 // sharingRefused caches whether the remote refuses sharing invitations.
 var sharingRefused *bool
 

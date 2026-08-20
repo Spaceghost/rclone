@@ -848,6 +848,7 @@ type Object struct {
 	size          int64     // size of the object
 	modTime       time.Time // modification time of the object
 	id            string    // ID of the object
+	etag          string    // eTag for metadata and content
 	hash          string    // Hash of the content, usually QuickXorHash but set as hash_type
 	mimeType      string    // Content-Type of object from server (may not be as uploaded)
 	meta          *Metadata // metadata properties
@@ -2302,6 +2303,10 @@ func (o *Object) setMetaData(info *api.Item) (err error) {
 		o.modTime = time.Time(info.GetLastModifiedDateTime())
 	}
 	o.id = info.GetID()
+	o.etag = ""
+	if !info.IsRemote() { // remoteItem has no eTag
+		o.etag = info.ETag
+	}
 	if o.meta == nil {
 		o.meta = o.fs.newMetadata(o.Remote())
 	}
@@ -2368,9 +2373,18 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 	return o.modTime
 }
 
+func (o *Object) newUpdateOpts(ctx context.Context, method, route string) rest.Opts {
+	if o.id == "" || o.etag == "" {
+		return o.fs.newOptsCallWithPath(ctx, o.remote, method, route)
+	}
+	opts := o.fs.newOptsCall(o.id, method, route)
+	opts.ExtraHeaders = map[string]string{"If-Match": o.etag}
+	return opts
+}
+
 // setModTime sets the modification time of the local fs object
 func (o *Object) setModTime(ctx context.Context, modTime time.Time) (*api.Item, error) {
-	opts := o.fs.newOptsCallWithPath(ctx, o.remote, "PATCH", "")
+	opts := o.newUpdateOpts(ctx, "PATCH", "")
 	update := api.SetFileSystemInfo{
 		FileSystemInfo: api.FileSystemInfoFacet{
 			CreatedDateTime:      api.Timestamp(o.tryGetBtime(modTime)),
@@ -2590,7 +2604,7 @@ func malwareDownloadError(avOverride bool, err error) error {
 
 // createUploadSession creates an upload session for the object
 func (o *Object) createUploadSession(ctx context.Context, src fs.ObjectInfo, modTime time.Time) (response *api.CreateUploadResponse, metadata fs.Metadata, err error) {
-	opts := o.fs.newOptsCallWithPath(ctx, o.remote, "POST", "/createUploadSession")
+	opts := o.newUpdateOpts(ctx, "POST", "/createUploadSession")
 	createRequest, metadata, err := o.fetchMetadataForCreate(ctx, src, opts.Options, modTime)
 	if err != nil {
 		return nil, metadata, err
