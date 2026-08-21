@@ -1,0 +1,151 @@
+name: validate VFS object change
+
+on:
+  pull_request:
+    branches:
+      - ci-vfs-object-changed
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: vfs-object-changed
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Apply patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              n = text.count(old)
+              if n != 1:
+                  raise SystemExit(f"{path}: expected one match, found {n}")
+              p.write_text(text.replace(old, new))
+
+          replace("fs/fs.go",
+              '\tErrorObjectNotFound              = errors.New("object not found")\n',
+              '\tErrorObjectNotFound              = errors.New("object not found")\n\tErrorObjectChanged               = errors.New("object changed")\n')
+
+          replace("vfs/vfscache/item.go",
+              '\tmodified        bool                     // set if the file has been modified since the last Open\n',
+              '\tmodified        bool                     // set if the file has been modified since the last Open\n\tconflict        bool                     // remote object changed while local data was dirty\n')
+
+          replace("vfs/vfscache/item.go",
+              '''func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
+\t// defer log.Trace(item.name, "item=%p", item)("err=%v", &err)
+
+\t// Transfer the temp file to the remote''',
+              '''func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
+\t// defer log.Trace(item.name, "item=%p", item)("err=%v", &err)
+
+\tif item.conflict {
+\t\treturn fs.ErrorObjectChanged
+\t}
+
+\t// Transfer the temp file to the remote''')
+
+          replace("vfs/vfscache/item.go",
+              '''\t\tif err != nil {
+\t\t\tif errors.Is(err, fs.ErrorCantUploadEmptyFiles) {''',
+              '''\t\tif err != nil {
+\t\t\tif errors.Is(err, fs.ErrorObjectChanged) {
+\t\t\t\titem.conflict = true
+\t\t\t}
+\t\t\tif errors.Is(err, fs.ErrorCantUploadEmptyFiles) {''')
+
+          replace("vfs/vfscache/item.go",
+              '\tif item.info.Dirty {\n\t\tfs.Infof(item.name, "vfs cache: queuing for upload in %v", item.c.opt.WriteBack)\n',
+              '\tif item.info.Dirty && !item.conflict {\n\t\tfs.Infof(item.name, "vfs cache: queuing for upload in %v", item.c.opt.WriteBack)\n')
+
+          replace("vfs/vfscache/item.go",
+              '''\t// see if the object still exists
+\tobj, _ := item.c.fremote.NewObject(ctx, item.name)
+\t// open the file with the object (or nil)''',
+              '''\t// see if the object still exists
+\tobj, _ := item.c.fremote.NewObject(ctx, item.name)
+\tif obj != nil {
+\t\titem.mu.Lock()
+\t\tfingerprint := item.info.Fingerprint
+\t\titem.mu.Unlock()
+\t\tif fingerprint != "" && fs.Fingerprint(ctx, obj, item.c.opt.FastFingerprint) != fingerprint {
+\t\t\titem.mu.Lock()
+\t\t\titem.conflict = true
+\t\t\titem.mu.Unlock()
+\t\t\tfs.Errorf(item.name, "vfs cache: remote object changed while local data was dirty - keeping local data")
+\t\t\tsize, err := item.GetSize()
+\t\t\tif err != nil {
+\t\t\t\treturn fmt.Errorf("reload: failed to read size: %w", err)
+\t\t\t}
+\t\t\treturn item.c.AddVirtual(item.name, size, false)
+\t\t}
+\t}
+\t// open the file with the object (or nil)''')
+
+          replace("vfs/vfscache/item.go",
+              '''\t\t\t\t} else {
+\t\t\t\t\tfs.Debugf(item.name, "vfs cache: remote object has changed but local object modified - keeping it (remote fingerprint %q != cached fingerprint %q)", remoteFingerprint, item.info.Fingerprint)
+\t\t\t\t}
+''',
+              '''\t\t\t\t} else {
+\t\t\t\t\titem.conflict = true
+\t\t\t\t\tfs.Debugf(item.name, "vfs cache: remote object has changed but local object modified - keeping it (remote fingerprint %q != cached fingerprint %q)", remoteFingerprint, item.info.Fingerprint)
+\t\t\t\t}
+''')
+
+          replace("vfs/vfscache/writeback/writeback.go",
+              '''\tif err != nil {
+\t\t// FIXME should this have a max number of transfer attempts?''',
+              '''\tif errors.Is(err, fs.ErrorObjectChanged) {
+\t\tfs.Errorf(wbItem.name, "vfs cache: upload stopped: %v", err)
+\t\twb._delItem(wbItem)
+\t} else if err != nil {
+\t\t// FIXME should this have a max number of transfer attempts?''')
+
+          replace("vfs/vfscache/writeback/writeback_test.go",
+              '''// Now test the upload being cancelled by another upload being added
+func TestWriteBackAddUpdate''',
+              '''func TestWriteBackAddObjectChanged(t *testing.T) {
+\twb, cancel := newTestWriteBack(t)
+\tdefer cancel()
+
+\tpi := newPutItem(t)
+\tid := wb.Add(0, "one", 10, true, pi.put)
+\twbItem := wb.lookup[id]
+
+\t<-pi.started
+\tpi.finish(fs.ErrorObjectChanged)
+\twaitUntilNoTransfers(t, wb)
+
+\tcheckNotOnHeap(t, wb, wbItem)
+\tcheckNotInLookup(t, wb, wbItem)
+}
+
+// Now test the upload being cancelled by another upload being added
+func TestWriteBackAddUpdate''')
+          PY
+          gofmt -w fs/fs.go vfs/vfscache/item.go vfs/vfscache/writeback/writeback.go vfs/vfscache/writeback/writeback_test.go
+
+      - name: Test
+        run: |
+          go test ./fs ./vfs/vfscache/... 
+          go vet ./vfs/vfscache/...
+          go build
+
+      - name: Commit branch
+        run: |
+          git config user.name Spaceghost
+          git config user.email 251370+Spaceghost@users.noreply.github.com
+          git add fs/fs.go vfs/vfscache/item.go vfs/vfscache/writeback/writeback.go vfs/vfscache/writeback/writeback_test.go
+          git commit -m 'vfs: preserve dirty files after remote changes' -m 'Add ErrorObjectChanged for backends which can detect stale writes. VFS writeback stops retrying that error and keeps the dirty cache entry.' -m 'On cache reload, use the saved remote fingerprint to keep a dirty entry from being written over a newer remote object.'
+          git push --force origin HEAD:vfs-object-changed
