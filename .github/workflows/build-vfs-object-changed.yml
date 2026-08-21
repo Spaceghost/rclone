@@ -1,0 +1,293 @@
+name: build VFS object change branch
+
+on:
+  push:
+    branches:
+      - tmp-vfs-object-changed-build
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: vfs-object-changed
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Apply change
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              if s.count(old) != 1:
+                  raise SystemExit(f"{path}: expected one match, found {s.count(old)}")
+              p.write_text(s.replace(old, new))
+
+          replace_once(
+              "fs/fs.go",
+              '\tErrorObjectNotFound              = errors.New("object not found")\n',
+              '\tErrorObjectNotFound              = errors.New("object not found")\n\tErrorObjectChanged               = errors.New("object changed")\n',
+          )
+
+          replace_once(
+              "vfs/vfscache/item.go",
+              '\tFingerprint string        // fingerprint of remote object\n\tDirty       bool          // set if the backing file has been modified\n',
+              '\tFingerprint string        // fingerprint of remote object\n\tDirty       bool          // set if the backing file has been modified\n\tConflict    bool          // set if writeback found the remote object changed\n',
+          )
+
+          replace_once(
+              "vfs/vfscache/item.go",
+              '''\t\tif err != nil {
+\t\t\tif errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
+\t\t\t\tfs.Errorf(name, "Writeback failed: %v", err)
+\t\t\t\treturn nil
+\t\t\t}
+\t\t\treturn fmt.Errorf("vfs cache: failed to transfer file from cache to remote: %w", err)
+\t\t}''',
+              '''\t\tif err != nil {
+\t\t\tif errors.Is(err, fs.ErrorObjectChanged) {
+\t\t\t\titem.info.Conflict = true
+\t\t\t\tif saveErr := item._save(); saveErr != nil {
+\t\t\t\t\tfs.Errorf(name, "vfs cache: failed to save conflict state: %v", saveErr)
+\t\t\t\t}
+\t\t\t}
+\t\t\tif errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
+\t\t\t\tfs.Errorf(name, "Writeback failed: %v", err)
+\t\t\t\treturn nil
+\t\t\t}
+\t\t\treturn fmt.Errorf("vfs cache: failed to transfer file from cache to remote: %w", err)
+\t\t}''',
+          )
+
+          replace_once(
+              "vfs/vfscache/item.go",
+              '\t// upload the file to backing store if changed\n\tif item.info.Dirty {\n',
+              '\t// upload the file to backing store if changed\n\tif item.info.Dirty && !item.info.Conflict {\n',
+          )
+
+          replace_once(
+              "vfs/vfscache/writeback/writeback.go",
+              '''\tif err != nil {
+\t\t// FIXME should this have a max number of transfer attempts?
+\t\twbItem.delay *= 2
+\t\tif wbItem.delay > maxUploadDelay {
+\t\t\twbItem.delay = maxUploadDelay
+\t\t}
+\t\tif errors.Is(err, context.Canceled) {
+\t\t\tfs.Infof(wbItem.name, "vfs cache: upload canceled")
+\t\t\t// Upload was cancelled so reset timer
+\t\t\twbItem.delay = time.Duration(wb.opt.WriteBack)
+\t\t} else {
+\t\t\tfs.Errorf(wbItem.name, "vfs cache: failed to upload try #%d, will retry in %v: %v", wbItem.tries, wbItem.delay, err)
+\t\t}
+\t\t// push the item back on the queue for retry
+\t\twb._pushItem(wbItem)
+\t\twb.items._update(wbItem, time.Now().Add(wbItem.delay))
+\t} else {''',
+              '''\tif errors.Is(err, fs.ErrorObjectChanged) {
+\t\tfs.Errorf(wbItem.name, "vfs cache: upload stopped: %v", err)
+\t\twb._delItem(wbItem)
+\t} else if err != nil {
+\t\t// FIXME should this have a max number of transfer attempts?
+\t\twbItem.delay *= 2
+\t\tif wbItem.delay > maxUploadDelay {
+\t\t\twbItem.delay = maxUploadDelay
+\t\t}
+\t\tif errors.Is(err, context.Canceled) {
+\t\t\tfs.Infof(wbItem.name, "vfs cache: upload canceled")
+\t\t\t// Upload was cancelled so reset timer
+\t\t\twbItem.delay = time.Duration(wb.opt.WriteBack)
+\t\t} else {
+\t\t\tfs.Errorf(wbItem.name, "vfs cache: failed to upload try #%d, will retry in %v: %v", wbItem.tries, wbItem.delay, err)
+\t\t}
+\t\t// push the item back on the queue for retry
+\t\twb._pushItem(wbItem)
+\t\twb.items._update(wbItem, time.Now().Add(wbItem.delay))
+\t} else {''',
+          )
+
+          replace_once(
+              "vfs/vfscache/writeback/writeback_test.go",
+              '''func TestWriteBackAddFailRetry(t *testing.T) {
+\twb, cancel := newTestWriteBack(t)
+\tdefer cancel()
+
+\tpi := newPutItem(t)
+
+\tid := wb.Add(0, "one", 10, true, pi.put)
+\twbItem := wb.lookup[id]
+\tcheckOnHeap(t, wb, wbItem)
+\tcheckInLookup(t, wb, wbItem)
+\tassert.Equal(t, "one", wb.string(t))
+
+\t<-pi.started
+\tcheckNotOnHeap(t, wb, wbItem)
+\tcheckInLookup(t, wb, wbItem)
+
+\tpi.finish(errors.New("transfer failed BOOM"))
+\twaitUntilNoTransfers(t, wb)
+\tcheckOnHeap(t, wb, wbItem)
+\tcheckInLookup(t, wb, wbItem)
+
+\t// check the retry
+\t<-pi.started
+\tcheckNotOnHeap(t, wb, wbItem)
+\tcheckInLookup(t, wb, wbItem)
+
+\tpi.finish(nil) // transfer successful
+\twaitUntilNoTransfers(t, wb)
+\tcheckNotOnHeap(t, wb, wbItem)
+\tcheckNotInLookup(t, wb, wbItem)
+}
+''',
+              '''func TestWriteBackAddFailRetry(t *testing.T) {
+\twb, cancel := newTestWriteBack(t)
+\tdefer cancel()
+
+\tpi := newPutItem(t)
+
+\tid := wb.Add(0, "one", 10, true, pi.put)
+\twbItem := wb.lookup[id]
+\tcheckOnHeap(t, wb, wbItem)
+\tcheckInLookup(t, wb, wbItem)
+\tassert.Equal(t, "one", wb.string(t))
+
+\t<-pi.started
+\tcheckNotOnHeap(t, wb, wbItem)
+\tcheckInLookup(t, wb, wbItem)
+
+\tpi.finish(errors.New("transfer failed BOOM"))
+\twaitUntilNoTransfers(t, wb)
+\tcheckOnHeap(t, wb, wbItem)
+\tcheckInLookup(t, wb, wbItem)
+
+\t// check the retry
+\t<-pi.started
+\tcheckNotOnHeap(t, wb, wbItem)
+\tcheckInLookup(t, wb, wbItem)
+
+\tpi.finish(nil) // transfer successful
+\twaitUntilNoTransfers(t, wb)
+\tcheckNotOnHeap(t, wb, wbItem)
+\tcheckNotInLookup(t, wb, wbItem)
+}
+
+func TestWriteBackAddObjectChanged(t *testing.T) {
+\twb, cancel := newTestWriteBack(t)
+\tdefer cancel()
+
+\tpi := newPutItem(t)
+\tid := wb.Add(0, "one", 10, true, pi.put)
+\twbItem := wb.lookup[id]
+
+\t<-pi.started
+\tpi.finish(fs.ErrorObjectChanged)
+\twaitUntilNoTransfers(t, wb)
+
+\tcheckNotOnHeap(t, wb, wbItem)
+\tcheckNotInLookup(t, wb, wbItem)
+}
+''',
+          )
+
+          replace_once(
+              "vfs/vfscache/item_test.go",
+              '''func TestItemDirty(t *testing.T) {
+\tr, c := newItemTestCache(t)
+\titem, _ := c.get("potato")
+\trequire.NoError(t, item.Open(nil))
+
+\tassert.Equal(t, false, item.IsDirty())
+
+\tn, err := item.WriteAt([]byte("hello"), 0)
+\trequire.NoError(t, err)
+\tassert.Equal(t, 5, n)
+
+\tassert.Equal(t, true, item.IsDirty())
+
+\trequire.NoError(t, item.Close(nil))
+
+\t// Sync writeback so expect clean here
+\tassert.Equal(t, false, item.IsDirty())
+
+\titem.Dirty()
+
+\tassert.Equal(t, true, item.IsDirty())
+\tcheckObject(t, r, "potato", "hello")
+}
+''',
+              '''func TestItemDirty(t *testing.T) {
+\tr, c := newItemTestCache(t)
+\titem, _ := c.get("potato")
+\trequire.NoError(t, item.Open(nil))
+
+\tassert.Equal(t, false, item.IsDirty())
+
+\tn, err := item.WriteAt([]byte("hello"), 0)
+\trequire.NoError(t, err)
+\tassert.Equal(t, 5, n)
+
+\tassert.Equal(t, true, item.IsDirty())
+
+\trequire.NoError(t, item.Close(nil))
+
+\t// Sync writeback so expect clean here
+\tassert.Equal(t, false, item.IsDirty())
+
+\titem.Dirty()
+
+\tassert.Equal(t, true, item.IsDirty())
+\tcheckObject(t, r, "potato", "hello")
+}
+
+func TestItemConflictBlocksWriteBack(t *testing.T) {
+\t_, c := newItemTestCache(t)
+\titem, _ := c.get("potato")
+\trequire.NoError(t, item.Open(nil))
+\t_, err := item.WriteAt([]byte("hello"), 0)
+\trequire.NoError(t, err)
+
+\titem.mu.Lock()
+\titem.info.Conflict = true
+\terr = item._save()
+\titem.mu.Unlock()
+\trequire.NoError(t, err)
+
+\trequire.NoError(t, item.Close(nil))
+\tassert.True(t, item.IsDirty())
+\tuploading, queued := c.writeback.Stats()
+\tassert.Zero(t, uploading)
+\tassert.Zero(t, queued)
+
+\treloaded := newItem(c, "potato")
+\treloaded.mu.Lock()
+\tconflict := reloaded.info.Conflict
+\treloaded.mu.Unlock()
+\tassert.True(t, conflict)
+}
+''',
+          )
+          PY
+          gofmt -w fs/fs.go vfs/vfscache/item.go vfs/vfscache/writeback/writeback.go vfs/vfscache/writeback/writeback_test.go vfs/vfscache/item_test.go
+      - name: Test
+        run: |
+          go test ./fs
+          go test ./vfs/vfscache/...
+          go vet ./vfs/vfscache/...
+          go build
+      - name: Commit
+        run: |
+          git config user.name Spaceghost
+          git config user.email 251370+Spaceghost@users.noreply.github.com
+          git add fs/fs.go vfs/vfscache/item.go vfs/vfscache/item_test.go vfs/vfscache/writeback/writeback.go vfs/vfscache/writeback/writeback_test.go
+          git commit -m 'vfs: preserve dirty files after remote changes' -m 'Backends can return ErrorObjectChanged when a conditional update finds that the remote object has changed. Treat that as a conflict instead of retrying the same write indefinitely.' -m 'Persist the conflict on the cache item so restarting rclone does not requeue the stale write.'
+          git push --force origin HEAD:vfs-object-changed
