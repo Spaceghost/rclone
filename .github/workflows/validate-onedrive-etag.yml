@@ -1,0 +1,27 @@
+name: validate OneDrive eTag patch
+
+on:
+  push:
+    branches:
+      - validate-onedrive-etag-2
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check formatting
+        run: test -z "$(gofmt -l backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go)"
+      - name: Test OneDrive backend
+        run: go test ./backend/onedrive/...
+      - name: Vet OneDrive backend
+        run: go vet ./backend/onedrive/...
+      - name: Build rclone
+        run: go build
