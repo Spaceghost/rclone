@@ -1,0 +1,116 @@
+name: clean conflict stack
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  clean:
+    if: github.event.pull_request.head.ref == 'clean-conflict-stack-trigger'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 2f7d4e3f9f5bd11934969312164a77b442470e71
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Rebuild and test stack
+        env:
+          RCLONE_CONFIG: /notfound
+        run: |
+          git config user.name Spaceghost
+          git config user.email 251370+Spaceghost@users.noreply.github.com
+          git fetch origin vfs-object-changed vfs-conflict-state onedrive-etag-preconditions
+
+          git cherry-pick c9ac5b3abde130e4563569b8c4c9d7cbd8a1f0ef
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('vfs/vfscache/writeback/writeback_test.go')
+          s = p.read_text()
+          old = '\tpi.finish(fs.ErrorObjectChanged)\n'
+          new = '\tpi.finish(fmt.Errorf("upload failed: %w", fs.ErrorObjectChanged))\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one writeback test match, found {s.count(old)}')
+          p.write_text(s.replace(old, new))
+          PY
+          gofmt -w vfs/vfscache/writeback/writeback_test.go
+          cat >/tmp/commit-message <<'EOF'
+          vfs: stop retrying uploads after remote changes
+
+          A backend can return ErrorObjectChanged when a conditional update finds
+          that the remote object no longer matches the version it read.
+
+          Treat this as a terminal writeback error instead of retrying the same
+          stale update indefinitely.
+          EOF
+          sed -i 's/^          //' /tmp/commit-message
+          git add vfs/vfscache/writeback/writeback_test.go
+          git commit --amend -F /tmp/commit-message
+          git diff --check HEAD^
+          go test ./fs ./vfs/vfscache/writeback
+          go vet ./vfs/vfscache/writeback
+          git push --force origin HEAD:vfs-object-changed
+
+          git cherry-pick 28e4ff2671cb330978e23630a92e5b75778b6cdb
+          cat >/tmp/commit-message <<'EOF'
+          vfs: preserve writeback conflicts across restarts
+
+          Store a conflict flag with dirty cache metadata when a backend reports
+          ErrorObjectChanged.
+
+          Do not queue the stale write again on close or cache reload. Keep the
+          local cache file dirty and visible for later conflict resolution.
+          EOF
+          sed -i 's/^          //' /tmp/commit-message
+          git commit --amend -F /tmp/commit-message
+          git diff --check HEAD^
+          go test ./vfs/vfscache/...
+          go vet ./vfs/vfscache/...
+          git push --force origin HEAD:vfs-conflict-state
+
+          git cherry-pick 3076216e2fc9c4658f57764769dc75c04de5179f
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('backend/onedrive/onedrive.go')
+          s = p.read_text()
+          old = 'if o.etag != "" && resp != nil && resp.StatusCode == http.StatusPreconditionFailed {'
+          new = 'if o.id != "" && o.etag != "" && resp != nil && resp.StatusCode == http.StatusPreconditionFailed {'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one OneDrive retry match, found {s.count(old)}')
+          p.write_text(s.replace(old, new))
+
+          p = Path('backend/onedrive/onedrive_test.go')
+          s = p.read_text()
+          old = 'o := &Object{etag: `"etag"`}'
+          new = 'o := &Object{id: "item", etag: `"etag"`}'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one OneDrive test match, found {s.count(old)}')
+          p.write_text(s.replace(old, new))
+          PY
+          gofmt -w backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go
+          cat >/tmp/commit-message <<'EOF'
+          onedrive: prevent overwriting files changed remotely
+
+          Keep the eTag from DriveItem metadata and send it with If-Match when
+          updating existing file content or modification time.
+
+          Translate a 412 response from those conditional requests to
+          ErrorObjectChanged so VFS writeback preserves the local cached version
+          instead of overwriting the newer remote file.
+          EOF
+          sed -i 's/^          //' /tmp/commit-message
+          git add backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go
+          git commit --amend -F /tmp/commit-message
+          git diff --check HEAD^
+          go test ./backend/onedrive
+          go vet ./backend/onedrive
+          make compiletest
+          make quicktest
+          git push --force origin HEAD:onedrive-etag-preconditions
