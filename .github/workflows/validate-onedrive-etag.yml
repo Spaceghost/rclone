@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - validate-onedrive-etag-2
+  pull_request:
+    branches:
+      - onedrive-etag-preconditions
 
 permissions:
   contents: read
