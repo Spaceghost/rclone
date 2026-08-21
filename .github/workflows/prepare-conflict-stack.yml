@@ -1,0 +1,465 @@
+name: prepare conflict stack
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.event.pull_request.head.ref == 'prepare-conflict-stack-trigger'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prepare and test stack
+        env:
+          RCLONE_CONFIG: /notfound
+        run: |
+          git config user.name Spaceghost
+          git config user.email 251370+Spaceghost@users.noreply.github.com
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              p.write_text(text.replace(old, new))
+
+          def insert_before(path, marker, addition):
+              replace_once(path, marker, addition + marker)
+
+          replace_once(
+              "fs/fs.go",
+              '\tErrorObjectNotFound              = errors.New("object not found")\n',
+              '\tErrorObjectNotFound              = errors.New("object not found")\n'
+              '\tErrorObjectChanged               = errors.New("object changed")\n',
+          )
+
+          replace_once(
+              "vfs/vfscache/writeback/writeback.go",
+              '''\tif err != nil {
+          \t\t// FIXME should this have a max number of transfer attempts?
+          ''',
+              '''\tif errors.Is(err, fs.ErrorObjectChanged) {
+          \t\tfs.Errorf(wbItem.name, "vfs cache: upload stopped: %v", err)
+          \t\twb._delItem(wbItem)
+          \t} else if err != nil {
+          \t\t// FIXME should this have a max number of transfer attempts?
+          ''',
+          )
+
+          insert_before(
+              "vfs/vfscache/writeback/writeback_test.go",
+              '''// Now test the upload being cancelled by another upload being added
+          func TestWriteBackAddUpdate(t *testing.T) {
+          ''',
+              '''// Now test a remote change stopping retries
+          func TestWriteBackAddObjectChanged(t *testing.T) {
+          \twb, cancel := newTestWriteBack(t)
+          \tdefer cancel()
+
+          \tpi := newPutItem(t)
+          \tid := wb.Add(0, "one", 10, true, pi.put)
+          \twbItem := wb.lookup[id]
+
+          \t<-pi.started
+          \tpi.finish(fs.ErrorObjectChanged)
+          \twaitUntilNoTransfers(t, wb)
+
+          \tcheckNotOnHeap(t, wb, wbItem)
+          \tcheckNotInLookup(t, wb, wbItem)
+          }
+
+          ''',
+          )
+          PY
+
+          gofmt -w fs/fs.go vfs/vfscache/writeback/writeback.go vfs/vfscache/writeback/writeback_test.go
+          git diff --check
+          go test ./fs ./vfs/vfscache/writeback
+          go vet ./vfs/vfscache/writeback
+          git add fs/fs.go vfs/vfscache/writeback/writeback.go vfs/vfscache/writeback/writeback_test.go
+          git commit -m 'vfs: stop retrying uploads after remote changes' -m 'A backend can return ErrorObjectChanged when a conditional update finds that the remote object no longer matches the version it read.' -m 'Treat this as a terminal writeback error instead of retrying the same stale update indefinitely.'
+          git push --force origin HEAD:vfs-object-changed
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              p.write_text(text.replace(old, new))
+
+          def insert_before(path, marker, addition):
+              replace_once(path, marker, addition + marker)
+
+          replace_once(
+              "vfs/vfscache/item.go",
+              '''\tFingerprint string        // fingerprint of remote object
+          \tDirty       bool          // set if the backing file has been modified
+          ''',
+              '''\tFingerprint string        // fingerprint of remote object
+          \tDirty       bool          // set if the backing file has been modified
+          \tConflict    bool          // set if writeback found the remote object changed
+          ''',
+          )
+
+          replace_once(
+              "vfs/vfscache/item.go",
+              '''\t\tif err != nil {
+          \t\t\tif errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
+          ''',
+              '''\t\tif err != nil {
+          \t\t\tif errors.Is(err, fs.ErrorObjectChanged) {
+          \t\t\t\titem.info.Conflict = true
+          \t\t\t\tif saveErr := item._save(); saveErr != nil {
+          \t\t\t\t\treturn fmt.Errorf("vfs cache: failed to save conflict state: %w", saveErr)
+          \t\t\t\t}
+          \t\t\t}
+          \t\t\tif errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
+          ''',
+          )
+
+          replace_once(
+              "vfs/vfscache/item.go",
+              '''\t// Show item is clean and is eligible for cache removal
+          \titem.info.Dirty = false
+          ''',
+              '''\t// Show item is clean and is eligible for cache removal
+          \titem.info.Dirty = false
+          \titem.info.Conflict = false
+          ''',
+          )
+
+          replace_once(
+              "vfs/vfscache/item.go",
+              '''\t// upload the file to backing store if changed
+          \tif item.info.Dirty {
+          ''',
+              '''\t// upload the file to backing store if changed
+          \tif item.info.Dirty && !item.info.Conflict {
+          ''',
+          )
+
+          replace_once(
+              "vfs/vfscache/item.go",
+              '''\titem.mu.Lock()
+          \tdirty := item.info.Dirty
+          \titem.mu.Unlock()
+          \tif !dirty {
+          \t\treturn nil
+          \t}
+          \t// see if the object still exists
+          \tobj, _ := item.c.fremote.NewObject(ctx, item.name)
+          \t// open the file with the object (or nil)
+          \terr := item.Open(obj)
+          \tif err != nil {
+          \t\treturn err
+          \t}
+          \t// close the file to execute the writeback if needed
+          \terr = item.Close(nil)
+          \tif err != nil {
+          \t\treturn err
+          \t}
+          ''',
+              '''\titem.mu.Lock()
+          \tdirty := item.info.Dirty
+          \tconflict := item.info.Conflict
+          \titem.mu.Unlock()
+          \tif !dirty {
+          \t\treturn nil
+          \t}
+          \tif conflict {
+          \t\tfs.Errorf(item.name, "vfs cache: writeback conflict - keeping local file")
+          \t} else {
+          \t\t// see if the object still exists
+          \t\tobj, _ := item.c.fremote.NewObject(ctx, item.name)
+          \t\t// open the file with the object (or nil)
+          \t\terr := item.Open(obj)
+          \t\tif err != nil {
+          \t\t\treturn err
+          \t\t}
+          \t\t// close the file to execute the writeback if needed
+          \t\terr = item.Close(nil)
+          \t\tif err != nil {
+          \t\t\treturn err
+          \t\t}
+          \t}
+          ''',
+          )
+
+          insert_before(
+              "vfs/vfscache/item_test.go",
+              '''func TestItemSync(t *testing.T) {
+          ''',
+              '''type objectChangedOnUpdate struct {
+          \tfs.Object
+          }
+
+          func (o objectChangedOnUpdate) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+          \treturn fs.ErrorObjectChanged
+          }
+
+          func TestItemObjectChanged(t *testing.T) {
+          \tr, c := newItemTestCache(t)
+          \tci := fs.GetConfig(c.ctx)
+          \toldInplace := ci.Inplace
+          \tci.Inplace = true
+          \tdefer func() { ci.Inplace = oldInplace }()
+
+          \tcontents, obj, item := newFile(t, r, c, "existing")
+          \trequire.NoError(t, item.Open(objectChangedOnUpdate{Object: obj}))
+          \t_, err := item.WriteAt([]byte("changed"), 0)
+          \trequire.NoError(t, err)
+          \trequire.ErrorIs(t, item.Close(nil), fs.ErrorObjectChanged)
+
+          \titem.mu.Lock()
+          \tassert.True(t, item.info.Dirty)
+          \tassert.True(t, item.info.Conflict)
+          \titem.mu.Unlock()
+          \tcheckObject(t, r, "existing", contents)
+
+          \treloaded := newItem(c, "existing")
+          \tc.put("existing", reloaded)
+          \trequire.NoError(t, reloaded.reload(c.ctx))
+
+          \treloaded.mu.Lock()
+          \tassert.True(t, reloaded.info.Dirty)
+          \tassert.True(t, reloaded.info.Conflict)
+          \treloaded.mu.Unlock()
+          \tcheckObject(t, r, "existing", contents)
+          }
+
+          ''',
+          )
+          PY
+
+          gofmt -w vfs/vfscache/item.go vfs/vfscache/item_test.go
+          git diff --check
+          go test ./vfs/vfscache/...
+          go vet ./vfs/vfscache/...
+          git add vfs/vfscache/item.go vfs/vfscache/item_test.go
+          git commit -m 'vfs: preserve writeback conflicts across restarts' -m 'Store a conflict flag with dirty cache metadata when a backend reports ErrorObjectChanged.' -m 'Do not queue the stale write again on close or cache reload. Keep the local cache file dirty and visible for later conflict resolution.'
+          git push --force origin HEAD:vfs-conflict-state
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              p.write_text(text.replace(old, new))
+
+          def insert_before(path, marker, addition):
+              replace_once(path, marker, addition + marker)
+
+          replace_once(
+              "backend/onedrive/onedrive.go",
+              '''\tid            string    // ID of the object
+          \thash          string    // Hash of the content, usually QuickXorHash but set as hash_type
+          ''',
+              '''\tid            string    // ID of the object
+          \tetag          string    // eTag for metadata and content
+          \thash          string    // Hash of the content, usually QuickXorHash but set as hash_type
+          ''',
+          )
+
+          replace_once(
+              "backend/onedrive/onedrive.go",
+              '''\to.id = info.GetID()
+          \tif o.meta == nil {
+          ''',
+              '''\to.id = info.GetID()
+          \to.etag = ""
+          \tif !info.IsRemote() {
+          \t\to.etag = info.ETag
+          \t}
+          \tif o.meta == nil {
+          ''',
+          )
+
+          insert_before(
+              "backend/onedrive/onedrive.go",
+              '''// setModTime sets the modification time of the local fs object
+          func (o *Object) setModTime(ctx context.Context, modTime time.Time) (*api.Item, error) {
+          ''',
+              '''func (o *Object) newUpdateOpts(ctx context.Context, method, route string) rest.Opts {
+          \tif o.id == "" || o.etag == "" {
+          \t\treturn o.fs.newOptsCallWithPath(ctx, o.remote, method, route)
+          \t}
+          \topts := o.fs.newOptsCall(o.id, method, route)
+          \topts.ExtraHeaders = map[string]string{"If-Match": o.etag}
+          \treturn opts
+          }
+
+          func (o *Object) shouldRetryUpdate(ctx context.Context, resp *http.Response, err error) (bool, error) {
+          \tif o.etag != "" && resp != nil && resp.StatusCode == http.StatusPreconditionFailed {
+          \t\treturn false, fmt.Errorf("%w: %v", fs.ErrorObjectChanged, err)
+          \t}
+          \treturn shouldRetry(ctx, resp, err)
+          }
+
+          ''',
+          )
+
+          replace_once(
+              "backend/onedrive/onedrive.go",
+              '''\topts := o.fs.newOptsCallWithPath(ctx, o.remote, "PATCH", "")
+          ''',
+              '''\topts := o.newUpdateOpts(ctx, "PATCH", "")
+          ''',
+          )
+
+          replace_once(
+              "backend/onedrive/onedrive.go",
+              '''\t\tresp, err := o.fs.srv.CallJSON(ctx, &opts, &update, &info)
+          \t\treturn shouldRetry(ctx, resp, err)
+          ''',
+              '''\t\tresp, err := o.fs.srv.CallJSON(ctx, &opts, &update, &info)
+          \t\treturn o.shouldRetryUpdate(ctx, resp, err)
+          ''',
+          )
+
+          replace_once(
+              "backend/onedrive/onedrive.go",
+              '''\topts := o.fs.newOptsCallWithPath(ctx, o.remote, "POST", "/createUploadSession")
+          ''',
+              '''\topts := o.newUpdateOpts(ctx, "POST", "/createUploadSession")
+          ''',
+          )
+
+          replace_once(
+              "backend/onedrive/onedrive.go",
+              '''\t\treturn shouldRetry(ctx, resp, err)
+          \t})
+          \treturn response, metadata, err
+          }
+
+          // getPosition gets the current position in a multipart upload
+          ''',
+              '''\t\treturn o.shouldRetryUpdate(ctx, resp, err)
+          \t})
+          \treturn response, metadata, err
+          }
+
+          // getPosition gets the current position in a multipart upload
+          ''',
+          )
+
+          replace_once(
+              "backend/onedrive/onedrive.go",
+              '''\topts := o.fs.newOptsCallWithPath(ctx, o.remote, "PUT", "/content")
+          ''',
+              '''\topts := o.newUpdateOpts(ctx, "PUT", "/content")
+          ''',
+          )
+
+          replace_once(
+              "backend/onedrive/onedrive.go",
+              '''\t\treturn shouldRetry(ctx, resp, err)
+          \t})
+          \tif err != nil {
+          \t\treturn nil, err
+          \t}
+
+          \terr = o.setMetaData(info)
+          ''',
+              '''\t\treturn o.shouldRetryUpdate(ctx, resp, err)
+          \t})
+          \tif err != nil {
+          \t\treturn nil, err
+          \t}
+
+          \terr = o.setMetaData(info)
+          ''',
+          )
+
+          replace_once(
+              "backend/onedrive/onedrive_test.go",
+              '''import (
+          \t"testing"
+
+          \t"github.com/rclone/rclone/fs"
+          ''',
+              '''import (
+          \t"context"
+          \t"errors"
+          \t"net/http"
+          \t"testing"
+
+          \t"github.com/rclone/rclone/backend/onedrive/api"
+          \t"github.com/rclone/rclone/fs"
+          ''',
+          )
+
+          replace_once(
+              "backend/onedrive/onedrive_test.go",
+              '''\t"github.com/rclone/rclone/fstest/fstests"
+          )
+
+          // TestIntegration runs integration tests against the remote
+          ''',
+              '''\t"github.com/rclone/rclone/fstest/fstests"
+          \t"github.com/stretchr/testify/assert"
+          \t"github.com/stretchr/testify/require"
+          )
+
+          func TestNewUpdateOpts(t *testing.T) {
+          \to := &Object{fs: &Fs{opt: Options{Region: regionGlobal}}}
+          \trequire.NoError(t, o.setMetaData(&api.Item{
+          \t\tID:              "item",
+          \t\tETag:            `"etag"`,
+          \t\tFile:            &api.FileFacet{},
+          \t\tParentReference: &api.ItemReference{DriveID: "drive"},
+          \t}))
+          \topts := o.newUpdateOpts(context.Background(), "POST", "/createUploadSession")
+          \tassert.Equal(t, graphAPIEndpoint[regionGlobal]+"/v1.0/drives", opts.RootURL)
+          \tassert.Equal(t, "/drive/items/item/createUploadSession", opts.Path)
+          \tassert.Equal(t, `"etag"`, opts.ExtraHeaders["If-Match"])
+          }
+
+          func TestShouldRetryUpdate(t *testing.T) {
+          \to := &Object{etag: `"etag"`}
+          \tretry, err := o.shouldRetryUpdate(context.Background(), &http.Response{StatusCode: http.StatusPreconditionFailed}, errors.New("precondition failed"))
+          \tassert.False(t, retry)
+          \trequire.ErrorIs(t, err, fs.ErrorObjectChanged)
+
+          \to.etag = ""
+          \tretry, err = o.shouldRetryUpdate(context.Background(), &http.Response{StatusCode: http.StatusPreconditionFailed}, errors.New("precondition failed"))
+          \tassert.False(t, retry)
+          \trequire.NotErrorIs(t, err, fs.ErrorObjectChanged)
+          }
+
+          // TestIntegration runs integration tests against the remote
+          ''',
+          )
+          PY
+
+          gofmt -w backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go
+          git diff --check
+          go test ./backend/onedrive
+          go vet ./backend/onedrive
+          make compiletest
+          git add backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go
+          git commit -m 'onedrive: prevent overwriting files changed remotely' -m 'Keep the eTag from DriveItem metadata and send it with If-Match when updating an existing file content or modification time.' -m 'Translate a 412 response from those conditional requests to ErrorObjectChanged so VFS writeback preserves the local cached version instead of overwriting the newer remote file.'
+          git push --force origin HEAD:onedrive-etag-preconditions
