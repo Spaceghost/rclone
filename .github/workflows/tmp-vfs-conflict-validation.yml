@@ -1,0 +1,46 @@
+name: validate VFS conflict stack
+
+on:
+  push:
+    branches:
+      - tmp-vfs-conflict-validation
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Format
+        run: |
+          gofmt -w fs/fs.go \
+            vfs/vfscache/writeback/writeback.go \
+            vfs/vfscache/writeback/writeback_test.go \
+            vfs/vfscache/item.go \
+            vfs/vfscache/conflict_state_test.go \
+            vfs/vfscache/conflict.go \
+            vfs/vfscache/conflict_test.go \
+            vfs/rc_conflict.go \
+            backend/onedrive/onedrive.go \
+            backend/onedrive/onedrive_test.go
+          git diff --exit-code
+      - name: Test changed packages
+        run: go test ./fs ./vfs/vfscache/writeback ./vfs/vfscache ./vfs ./backend/onedrive
+      - name: Race test VFS
+        run: go test -race ./vfs/vfscache/... ./vfs
+      - name: Stress conflict resolution
+        run: go test -race -count=20 -run '^(TestItemObjectChanged|TestCacheConflicts|TestCacheResolveConflict)' ./vfs/vfscache
+      - name: Vet changed packages
+        run: go vet ./fs ./vfs/vfscache/writeback ./vfs/vfscache ./vfs ./backend/onedrive
+      - name: Build
+        run: go build ./...
+      - name: Quick test
+        run: make quicktest
