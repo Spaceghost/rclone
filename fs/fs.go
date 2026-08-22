@@ -35,6 +35,7 @@ var (
 	ErrorCantSetModTimeWithoutDelete = errors.New("can't set modified time without deleting existing object")
 	ErrorDirNotFound                 = errors.New("directory not found")
 	ErrorObjectNotFound              = errors.New("object not found")
+	ErrorObjectChanged               = errors.New("object changed")
 	ErrorLevelNotSupported           = errors.New("level value not supported")
 	ErrorListAborted                 = errors.New("list aborted")
 	ErrorListBucketRequired          = errors.New("bucket or container name is needed in remote")
