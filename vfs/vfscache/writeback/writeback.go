@@ -362,7 +362,10 @@ func (wb *WriteBack) upload(ctx context.Context, wbItem *writeBackItem) {
 	wbItem.uploading = false
 	wb.uploads--
 
-	if err != nil {
+	if errors.Is(err, fs.ErrorObjectChanged) {
+		fs.Errorf(wbItem.name, "vfs cache: upload stopped: %v", err)
+		wb._delItem(wbItem)
+	} else if err != nil {
 		// FIXME should this have a max number of transfer attempts?
 		wbItem.delay *= 2
 		if wbItem.delay > maxUploadDelay {
