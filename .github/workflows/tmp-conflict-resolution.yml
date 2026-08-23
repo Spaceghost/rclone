@@ -3,7 +3,6 @@ name: temporary conflict stack validation
 on:
   pull_request:
     paths:
-      - ".github/tmp-conflict-resolution.patch"
       - ".github/workflows/tmp-conflict-resolution.yml"
 
 permissions:
@@ -12,40 +11,51 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
-          cache: true
-      - name: Rebuild and validate stack
+          go-version: "~1.27.0"
+          check-latest: true
+          cache: false
+
+      - name: Install test dependencies
+        run: |
+          sudo modprobe fuse
+          sudo chmod 666 /dev/fuse
+          sudo chown root:$USER /etc/fuse.conf
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse-dev rpm pkg-config git-annex git-annex-remote-rclone nfs-common
+          sudo rm -f /usr/local/bin/fusermount /usr/local/bin/fusermount3
+
+      - name: Rebuild and test stack
         env:
           GOTOOLCHAIN: local
           RCLONE_CONFIG: /notfound
         run: |
           set -euxo pipefail
 
-          cp .github/tmp-conflict-resolution.patch /tmp/conflict-resolution.patch
           git config user.name Spaceghost
           git config user.email 251370+Spaceghost@users.noreply.github.com
           git fetch origin master vfs-object-changed vfs-conflict-state vfs-conflict-resolution onedrive-etag-preconditions
 
           base=$(git rev-parse origin/master)
-          object_changed=$(git rev-parse origin/vfs-object-changed)
-          conflict_state=$(git rev-parse origin/vfs-conflict-state)
-          conflict_resolution=$(git rev-parse origin/vfs-conflict-resolution)
-          onedrive=$(git rev-parse origin/onedrive-etag-preconditions)
+          old_core=$(git rev-parse origin/vfs-object-changed)
+          old_state=$(git rev-parse origin/vfs-conflict-state)
+          old_resolution=$(git rev-parse origin/vfs-conflict-resolution)
+          old_onedrive=$(git rev-parse origin/onedrive-etag-preconditions)
 
-          author_name=$(git show -s --format=%an "$object_changed")
-          author_email=$(git show -s --format=%ae "$object_changed")
-          author_date=$(git show -s --format=%aI "$object_changed")
+          author_name=$(git show -s --format=%an "$old_core")
+          author_email=$(git show -s --format=%ae "$old_core")
+          author_date=$(git show -s --format=%aI "$old_core")
 
           git checkout --detach "$base"
-          git cherry-pick "$object_changed"
-          git cherry-pick "$conflict_state"
+          git cherry-pick "$old_core"
+          git cherry-pick "$old_state"
           git reset --soft "$base"
           cat >/tmp/core-message <<'EOF'
           vfs: preserve local writes after remote changes
@@ -53,25 +63,102 @@ jobs:
           Backends can return ErrorObjectChanged when a conditional update finds
           that the remote object no longer matches the version read by rclone.
 
-          Treat this as a terminal writeback conflict and persist the state with
-          the dirty cache entry so restart does not retry the stale upload.
+          Treat this as a terminal writeback conflict. Keep the dirty cache entry
+          and persist the conflict so restart does not retry the stale upload.
           EOF
           sed -i 's/^          //' /tmp/core-message
           GIT_AUTHOR_NAME="$author_name" GIT_AUTHOR_EMAIL="$author_email" GIT_AUTHOR_DATE="$author_date" git commit -F /tmp/core-message
           core_head=$(git rev-parse HEAD)
+          test "$(git rev-list --count "$base..$core_head")" -eq 1
+          go test ./fs ./vfs/vfscache/writeback ./vfs/vfscache
 
-          git cherry-pick "$conflict_resolution"
-          if ! grep -q 'resolving.*chan struct' vfs/vfscache/item.go; then
-            git apply /tmp/conflict-resolution.patch
+          git cherry-pick "$old_resolution"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("vfs/vfscache/conflict_test.go")
+          s = p.read_text()
+          test = r'''
+          func TestCacheResolveConflictDryRun(t *testing.T) {
+          	r, c, remoteContents, localContents, _ := newWritebackConflict(t, "existing.txt")
+          	ctx, ci := fs.AddConfig(context.Background())
+          	ci.DryRun = true
+
+          	_, err := c.ResolveConflict(ctx, "existing.txt", conflictKeepRemote)
+          	require.EqualError(t, err, "can't resolve writeback conflicts with --dry-run")
+          	assert.Len(t, c.Conflicts(), 1)
+          	checkObject(t, r, "existing.txt", remoteContents)
+
+          	data, err := os.ReadFile(c.toOSPath("existing.txt"))
+          	require.NoError(t, err)
+          	assert.Equal(t, localContents, string(data))
+          }
+          '''
+          if "func TestCacheResolveConflictDryRun" not in s:
+              s += test
+          p.write_text(s)
+          PY
+          gofmt -w vfs/vfscache/conflict_test.go
+
+          if go test ./vfs/vfscache -run '^TestCacheResolveConflictDryRun$'; then
+            echo "dry-run regression test unexpectedly passed before the fix" >&2
+            exit 1
           fi
-          gofmt -w vfs/vfscache/item.go vfs/vfscache/conflict.go vfs/vfscache/conflict_test.go
-          git diff --check
-          git add vfs/vfscache/item.go vfs/vfscache/conflict.go vfs/vfscache/conflict_test.go
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("vfs/vfscache/conflict.go")
+          s = p.read_text()
+          old = '''\tswitch action {
+          \tcase conflictKeepLocal, conflictKeepRemote, conflictKeepBoth:
+          \tdefault:
+          \t\treturn "", fmt.Errorf("unknown conflict action %q", action)
+          \t}
+
+          \titem, id, err := c.claimConflict(name)
+          '''
+          new = '''\tswitch action {
+          \tcase conflictKeepLocal, conflictKeepRemote, conflictKeepBoth:
+          \tdefault:
+          \t\treturn "", fmt.Errorf("unknown conflict action %q", action)
+          \t}
+          \tif fs.GetConfig(ctx).DryRun {
+          \t\treturn "", errors.New("can't resolve writeback conflicts with --dry-run")
+          \t}
+
+          \titem, id, err := c.claimConflict(name)
+          '''
+          if s.count(old) != 1:
+              raise SystemExit(f"expected one ResolveConflict insertion point, found {s.count(old)}")
+          p.write_text(s.replace(old, new))
+
+          p = Path("vfs/rc_conflict.go")
+          s = p.read_text()
+          old = '''keep-both leaves the current remote file in place and writes the
+          cached local revision under a device-named conflict file.
+          ` + getVFSHelp,
+          '''
+          new = '''keep-both leaves the current remote file in place and writes the
+          cached local revision under a device-named conflict file.
+
+          Conflict resolution is not available with --dry-run.
+          ` + getVFSHelp,
+          '''
+          if s.count(old) != 1:
+              raise SystemExit(f"expected one RC help insertion point, found {s.count(old)}")
+          p.write_text(s.replace(old, new))
+          PY
+          gofmt -w vfs/vfscache/conflict.go vfs/vfscache/conflict_test.go vfs/rc_conflict.go
+          go test ./vfs/vfscache -run '^TestCacheResolveConflictDryRun$'
+
+          git add vfs/vfscache/conflict.go vfs/vfscache/conflict_test.go vfs/rc_conflict.go
           cat >/tmp/resolution-message <<'EOF'
           vfs: add writeback conflict resolution
 
-          Add RC calls to list writeback conflicts and resolve them by keeping
-          the local, remote, or both revisions.
+          Add authenticated RC calls to list writeback conflicts and select the
+          local revision, remote revision, or both.
 
           Keep-local retries against the current remote object. Keep-both writes
           the local revision to a device-named conflict file.
@@ -79,33 +166,11 @@ jobs:
           sed -i 's/^          //' /tmp/resolution-message
           git commit --amend -F /tmp/resolution-message
           resolution_head=$(git rev-parse HEAD)
+          test "$(git rev-parse "$resolution_head^")" = "$core_head"
+          test "$(git rev-list --count "$core_head..$resolution_head")" -eq 1
 
-          git cherry-pick "$onedrive"
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path("backend/onedrive/onedrive.go")
-          s = p.read_text()
-          old = 'if o.etag != "" && resp != nil && resp.StatusCode == http.StatusPreconditionFailed {'
-          new = 'if o.id != "" && o.etag != "" && resp != nil && resp.StatusCode == http.StatusPreconditionFailed {'
-          if old in s:
-              s = s.replace(old, new, 1)
-          elif new not in s:
-              raise SystemExit("OneDrive precondition guard not found")
-          p.write_text(s)
-
-          p = Path("backend/onedrive/onedrive_test.go")
-          s = p.read_text()
-          old = 'o := &Object{etag: `"etag"`}'
-          new = 'o := &Object{id: "item", etag: `"etag"`}'
-          if old in s:
-              s = s.replace(old, new, 1)
-          elif new not in s:
-              raise SystemExit("OneDrive precondition test object not found")
-          p.write_text(s)
-          PY
+          git cherry-pick "$old_onedrive"
           gofmt -w backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go
-          git diff --check
           git add backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go
           cat >/tmp/onedrive-message <<'EOF'
           onedrive: prevent overwriting files changed remotely
@@ -119,15 +184,33 @@ jobs:
           sed -i 's/^          //' /tmp/onedrive-message
           git commit --amend -F /tmp/onedrive-message
           onedrive_head=$(git rev-parse HEAD)
+          test "$(git rev-parse "$onedrive_head^")" = "$resolution_head"
+          test "$(git rev-list --count "$resolution_head..$onedrive_head")" -eq 1
+          test "$(git rev-list --count "$base..$onedrive_head")" -eq 3
 
           test -z "$(gofmt -l fs/fs.go vfs/vfscache/writeback/writeback.go vfs/vfscache/writeback/writeback_test.go vfs/vfscache/item.go vfs/vfscache/conflict_state_test.go vfs/vfscache/conflict.go vfs/vfscache/conflict_test.go vfs/rc_conflict.go vfs/rc_conflict_test.go backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go)"
           git diff --check "$base"
+          bin/check_autogenerated_edits.py "$base"
           go test ./fs ./vfs/vfscache/writeback ./vfs/vfscache ./vfs ./backend/onedrive
           go test -race ./vfs/vfscache/... ./vfs
           go vet ./fs ./vfs/vfscache/writeback ./vfs/vfscache ./vfs ./backend/onedrive
           go build
+          make
           make quicktest
 
-          git push --force origin "$core_head":refs/heads/vfs-object-changed
-          git push --force origin "$resolution_head":refs/heads/vfs-conflict-resolution
-          git push --force origin "$onedrive_head":refs/heads/onedrive-etag-preconditions
+          echo "CORE_HEAD=$core_head" >> "$GITHUB_ENV"
+          echo "RESOLUTION_HEAD=$resolution_head" >> "$GITHUB_ENV"
+          echo "ONEDRIVE_HEAD=$onedrive_head" >> "$GITHUB_ENV"
+
+      - name: Lint final stack
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+          skip-cache: true
+
+      - name: Push validated stack
+        run: |
+          set -euxo pipefail
+          git push --force origin "$CORE_HEAD":refs/heads/vfs-object-changed
+          git push --force origin "$RESOLUTION_HEAD":refs/heads/vfs-conflict-resolution
+          git push --force origin "$ONEDRIVE_HEAD":refs/heads/onedrive-etag-preconditions
