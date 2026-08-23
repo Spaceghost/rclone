@@ -1,0 +1,155 @@
+name: temporary conflict resolution validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/tmp-conflict-resolution.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Polish and validate stack
+        env:
+          RCLONE_CONFIG: /notfound
+        run: |
+          git config user.name Spaceghost
+          git config user.email 251370+Spaceghost@users.noreply.github.com
+          git fetch origin vfs-conflict-resolution onedrive-etag-preconditions
+
+          resolution_old=$(git rev-parse origin/vfs-conflict-resolution)
+          git checkout -B vfs-conflict-resolution origin/vfs-conflict-resolution
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              p.write_text(text.replace(old, new))
+
+          replace_once(
+              "vfs/rc_conflict.go",
+              "Use vfs/resolve-conflict to choose which revision to keep.",
+              "No action is taken automatically. Use vfs/resolve-conflict to choose\nwhich revision to keep.",
+          )
+          replace_once(
+              "vfs/rc_conflict.go",
+              "cached local revision under a numbered .conflict name.",
+              "cached local revision under a device-named conflict file.",
+          )
+          replace_once(
+              "vfs/vfscache/item.go",
+              "// Wait for any operation which temporarily owns the closed item.",
+              "// Wait for close or conflict resolution to release the item.",
+          )
+          PY
+          gofmt -w vfs/rc_conflict.go vfs/vfscache/item.go
+          git diff --check
+          git add vfs/rc_conflict.go vfs/vfscache/item.go
+          cat >/tmp/resolution-message <<'EOF'
+          vfs: add writeback conflict resolution
+
+          Add authenticated RC calls to list writeback conflicts and select the
+          local revision, remote revision, or both.
+
+          Keep-local retries against the current remote object. Keep-both writes
+          the local revision to a device-named conflict file.
+          EOF
+          sed -i 's/^          //' /tmp/resolution-message
+          git commit --amend -F /tmp/resolution-message
+          resolution_head=$(git rev-parse HEAD)
+
+          git checkout -B onedrive-etag-preconditions origin/onedrive-etag-preconditions
+          git rebase --onto "$resolution_head" "$resolution_old" onedrive-etag-preconditions
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              p.write_text(text.replace(old, new))
+
+          replace_once(
+              "backend/onedrive/onedrive_test.go",
+              '''\tassert.Equal(t, `"etag"`, opts.ExtraHeaders["If-Match"])
+          }
+          ''',
+              '''\tassert.Equal(t, `"etag"`, opts.ExtraHeaders["If-Match"])
+
+          \trequire.NoError(t, o.setMetaData(&api.Item{
+          \t\tETag: `"shortcut-etag"`,
+          \t\tRemoteItem: &api.RemoteItemFacet{
+          \t\t\tID:              "shared-item",
+          \t\t\tFile:            &api.FileFacet{},
+          \t\t\tParentReference: &api.ItemReference{DriveID: "shared-drive"},
+          \t\t},
+          \t}))
+          \topts = o.newUpdateOpts(context.Background(), "POST", "/createUploadSession")
+          \tassert.Empty(t, opts.ExtraHeaders)
+          }
+          ''',
+          )
+          replace_once(
+              "backend/onedrive/onedrive_test.go",
+              '''\to.etag = ""
+          \tretry, err = o.shouldRetryUpdate(context.Background(), &http.Response{StatusCode: http.StatusPreconditionFailed}, errors.New("precondition failed"))
+          \tassert.False(t, retry)
+          \trequire.NotErrorIs(t, err, fs.ErrorObjectChanged)
+          ''',
+              '''\to.id = ""
+          \tretry, err = o.shouldRetryUpdate(context.Background(), &http.Response{StatusCode: http.StatusPreconditionFailed}, errors.New("precondition failed"))
+          \tassert.False(t, retry)
+          \trequire.NotErrorIs(t, err, fs.ErrorObjectChanged)
+
+          \to.id = "item"
+          \to.etag = ""
+          \tretry, err = o.shouldRetryUpdate(context.Background(), &http.Response{StatusCode: http.StatusPreconditionFailed}, errors.New("precondition failed"))
+          \tassert.False(t, retry)
+          \trequire.NotErrorIs(t, err, fs.ErrorObjectChanged)
+          ''',
+          )
+          PY
+          gofmt -w backend/onedrive/onedrive_test.go
+          git diff --check
+          git add backend/onedrive/onedrive_test.go
+          cat >/tmp/onedrive-message <<'EOF'
+          onedrive: prevent overwriting files changed remotely
+
+          Keep the eTag from DriveItem metadata and send it with If-Match when
+          updating existing file content or modification time.
+
+          Return ErrorObjectChanged when Microsoft Graph rejects a stale update
+          with HTTP 412 so callers can preserve the local revision.
+          EOF
+          sed -i 's/^          //' /tmp/onedrive-message
+          git commit --amend -F /tmp/onedrive-message
+          onedrive_head=$(git rev-parse HEAD)
+
+          test -z "$(gofmt -l fs/fs.go vfs/vfscache/writeback/writeback.go vfs/vfscache/writeback/writeback_test.go vfs/vfscache/item.go vfs/vfscache/conflict_state_test.go vfs/vfscache/conflict.go vfs/vfscache/conflict_test.go vfs/rc_conflict.go vfs/rc_conflict_test.go backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go)"
+          git diff --check 64ab1ac32260238eefca3c61327f5faf1c6e106f
+          go test ./fs ./vfs/vfscache/writeback ./vfs/vfscache ./vfs ./backend/onedrive
+          go test -race ./vfs/vfscache/... ./vfs
+          go test -race -count=20 -run '^(TestItemObjectChanged|TestCacheConflicts|TestCacheResolveConflict)' ./vfs/vfscache
+          go vet ./fs ./vfs/vfscache/writeback ./vfs/vfscache ./vfs ./backend/onedrive
+          go build
+          go list ./... | grep -vE '/cmd/(gitannex|nfsmount)$' | xargs go test -timeout 20m
+
+          git push --force origin "$resolution_head":refs/heads/vfs-conflict-resolution
+          git push --force origin "$onedrive_head":refs/heads/onedrive-etag-preconditions
