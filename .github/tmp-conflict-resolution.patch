@@ -1,0 +1,205 @@
+diff --git a/vfs/vfscache/item.go b/vfs/vfscache/item.go
+index 5102f6143..000000000 100644
+--- a/vfs/vfscache/item.go
++++ b/vfs/vfscache/item.go
+@@ -76,5 +76,6 @@ type Item struct {
+ 	graceTimer      *time.Timer              // timer for delayed close after grace period
+ 	closing         chan struct{}            // non-nil while a grace-period close is tearing the handle down, closed when done
++	resolving       chan struct{}            // non-nil while conflict resolution is in progress, closed when done
+ }
+ 
+ // Info is persisted to backing store
+@@ -464,12 +465,14 @@ func (item *Item) open(o fs.Object) (err error) {
+ 	item.mu.Lock()
+ 	defer item.mu.Unlock()
+ 
+-	// Wait for any in-progress grace-period close to finish so we start
+-	// from a fully closed item rather than racing the fd teardown.
+-	for item.closing != nil {
+-		closing := item.closing
++	// Wait for any operation which temporarily owns the closed item.
++	for item.closing != nil || item.resolving != nil {
++		wait := item.closing
++		if wait == nil {
++			wait = item.resolving
++		}
+ 		item.mu.Unlock()
+-		<-closing
++		<-wait
+ 		item.mu.Lock()
+ 	}
+ 
+diff --git a/vfs/vfscache/conflict.go b/vfs/vfscache/conflict.go
+index a5c14157f..000000000 100644
+--- a/vfs/vfscache/conflict.go
++++ b/vfs/vfscache/conflict.go
+@@ -5,5 +5,6 @@ import (
+ 	"errors"
+ 	"fmt"
++	"os"
+ 	"path"
+ 	"sort"
+ 	"strings"
+@@ -59,6 +60,9 @@ func (c *Cache) claimConflict(name string) (*Item, writeback.Handle, error) {
+ 		return nil, 0, fmt.Errorf("writeback conflict %q not found", name)
+ 	}
+ 	defer item.mu.Unlock()
++	if item.resolving != nil {
++		return nil, 0, fmt.Errorf("writeback conflict %q is being resolved", name)
++	}
+ 	if !item.info.Conflict {
+ 		return nil, 0, fmt.Errorf("writeback conflict %q not found", name)
+ 	}
+@@ -66,12 +70,20 @@ func (c *Cache) claimConflict(name string) (*Item, writeback.Handle, error) {
+ 		return nil, 0, fmt.Errorf("writeback conflict %q is in use", name)
+ 	}
+ 
++	item.resolving = make(chan struct{})
+ 	item.info.Conflict = false
+ 	id := item.writeBackID
+ 	item.writeBackID = 0
+ 	return item, id, nil
+ }
+ 
++func (item *Item) finishConflictResolution() {
++	item.mu.Lock()
++	close(item.resolving)
++	item.resolving = nil
++	item.mu.Unlock()
++}
++
+ func (item *Item) restoreConflict(err error) error {
+ 	item.mu.Lock()
+ 	item.info.Conflict = true
+@@ -85,7 +97,7 @@ func (item *Item) restoreConflict(err error) error {
+ 	return err
+ }
+ 
+-func conflictName(name string, n int) string {
++func conflictName(name, hostname string, n int) string {
+ 	dir, leaf := path.Split(name)
+ 	ext := path.Ext(leaf)
+ 	if ext == leaf {
+@@ -93,10 +105,18 @@ func conflictName(name string, n int) string {
+ 	}
+ 	base := strings.TrimSuffix(leaf, ext)
+-	return path.Join(dir, fmt.Sprintf("%s.conflict%d%s", base, n, ext))
++	suffix := "-" + hostname
++	if n > 1 {
++		suffix += fmt.Sprintf("-%d", n)
++	}
++	return path.Join(dir, base+suffix+ext)
+ }
+ 
+ func (c *Cache) nextConflictName(ctx context.Context, name string) (string, error) {
++	hostname, err := os.Hostname()
++	if err != nil || hostname == "" {
++		hostname = "rclone"
++	}
+ 	for n := 1; ; n++ {
+-		candidate := conflictName(name, n)
++		candidate := conflictName(name, hostname, n)
+ 		c.mu.Lock()
+ 		_, cached := c.item[candidate]
+@@ -181,6 +201,7 @@ func (c *Cache) ResolveConflict(ctx context.Context, name, action string) (confli
+ 	if err != nil {
+ 		return "", err
+ 	}
++	defer item.finishConflictResolution()
+ 	c.writeback.Remove(id)
+ 
+ 	switch action {
+diff --git a/vfs/vfscache/conflict_test.go b/vfs/vfscache/conflict_test.go
+index 56a924aad..0091e0ed1 100644
+--- a/vfs/vfscache/conflict_test.go
++++ b/vfs/vfscache/conflict_test.go
+@@ -3,6 +3,7 @@ package vfscache
+ import (
+ 	"context"
+ 	"io"
++	"os"
+ 	"testing"
+ 	"time"
+ 
+@@ -59,9 +60,9 @@ func (o blockingUpdateObject) Update(ctx context.Context, in io.Reader, src fs.O
+ }
+ 
+ func TestConflictName(t *testing.T) {
+-	assert.Equal(t, "file.conflict1.txt", conflictName("file.txt", 1))
+-	assert.Equal(t, "archive.tar.conflict2.gz", conflictName("archive.tar.gz", 2))
+-	assert.Equal(t, ".profile.conflict3", conflictName(".profile", 3))
++	assert.Equal(t, "file-workstation.txt", conflictName("file.txt", "workstation", 1))
++	assert.Equal(t, "archive.tar-workstation-2.gz", conflictName("archive.tar.gz", "workstation", 2))
++	assert.Equal(t, ".profile-workstation", conflictName(".profile", "workstation", 1))
+ }
+ 
+ func TestCacheConflicts(t *testing.T) {
+@@ -110,17 +111,50 @@ func TestCacheResolveConflictKeepLocalConcurrent(t *testing.T) {
+ 	<-started
+ 
+ 	_, err := c.ResolveConflict(context.Background(), "existing.txt", conflictKeepLocal)
+-	require.EqualError(t, err, `writeback conflict "existing.txt" not found`)
++	require.EqualError(t, err, `writeback conflict "existing.txt" is being resolved`)
+ 	close(finish)
+ 	require.NoError(t, <-done)
+ }
+ 
++func TestCacheResolveConflictBlocksOpen(t *testing.T) {
++	_, c, _, _, item := newWritebackConflict(t, "existing.txt")
++	started := make(chan struct{})
++	finish := make(chan struct{})
++	c.fremote = blockingUpdateFs{Fs: c.fremote, started: started, finish: finish}
++	remote, err := c.fremote.NewObject(context.Background(), "existing.txt")
++	require.NoError(t, err)
++
++	resolved := make(chan error, 1)
++	go func() {
++		_, err := c.ResolveConflict(context.Background(), "existing.txt", conflictKeepLocal)
++		resolved <- err
++	}()
++	<-started
++
++	opened := make(chan error, 1)
++	go func() {
++		opened <- item.Open(remote)
++	}()
++	select {
++	case err := <-opened:
++		t.Fatalf("Open returned during conflict resolution: %v", err)
++	case <-time.After(50 * time.Millisecond):
++	}
++
++	close(finish)
++	require.NoError(t, <-resolved)
++	require.NoError(t, <-opened)
++	require.NoError(t, item.Close(nil))
++}
++
+ func TestCacheResolveConflictKeepBoth(t *testing.T) {
+ 	r, c, remoteContents, localContents, _ := newWritebackConflict(t, "existing.txt")
++	hostname, err := os.Hostname()
++	require.NoError(t, err)
+ 
+ 	conflictFile, err := c.ResolveConflict(context.Background(), "existing.txt", conflictKeepBoth)
+ 	require.NoError(t, err)
+-	assert.Equal(t, "existing.conflict1.txt", conflictFile)
++	assert.Equal(t, conflictName("existing.txt", hostname, 1), conflictFile)
+ 	assert.Empty(t, c.Conflicts())
+ 	assertPathNotExist(t, c.toOSPath("existing.txt"))
+ 	assertPathNotExist(t, c.toOSPathMeta("existing.txt"))
+@@ -131,11 +165,14 @@ func TestCacheResolveConflictKeepBoth(t *testing.T) {
+ 
+ func TestCacheResolveConflictKeepBothNumbered(t *testing.T) {
+ 	r, c, _, localContents, _ := newWritebackConflict(t, "existing.txt")
+-	r.WriteObject(context.Background(), "existing.conflict1.txt", "occupied", time.Now())
++	hostname, err := os.Hostname()
++	require.NoError(t, err)
++	occupied := conflictName("existing.txt", hostname, 1)
++	r.WriteObject(context.Background(), occupied, "occupied", time.Now())
+ 
+ 	conflictFile, err := c.ResolveConflict(context.Background(), "existing.txt", conflictKeepBoth)
+ 	require.NoError(t, err)
+-	assert.Equal(t, "existing.conflict2.txt", conflictFile)
++	assert.Equal(t, conflictName("existing.txt", hostname, 2), conflictFile)
+ 	checkObject(t, r, conflictFile, localContents)
+ }
