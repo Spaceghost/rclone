@@ -1,0 +1,133 @@
+name: temporary conflict stack validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/tmp-conflict-resolution.patch"
+      - ".github/workflows/tmp-conflict-resolution.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Rebuild and validate stack
+        env:
+          GOTOOLCHAIN: local
+          RCLONE_CONFIG: /notfound
+        run: |
+          set -euxo pipefail
+
+          cp .github/tmp-conflict-resolution.patch /tmp/conflict-resolution.patch
+          git config user.name Spaceghost
+          git config user.email 251370+Spaceghost@users.noreply.github.com
+          git fetch origin master vfs-object-changed vfs-conflict-state vfs-conflict-resolution onedrive-etag-preconditions
+
+          base=$(git rev-parse origin/master)
+          object_changed=$(git rev-parse origin/vfs-object-changed)
+          conflict_state=$(git rev-parse origin/vfs-conflict-state)
+          conflict_resolution=$(git rev-parse origin/vfs-conflict-resolution)
+          onedrive=$(git rev-parse origin/onedrive-etag-preconditions)
+
+          author_name=$(git show -s --format=%an "$object_changed")
+          author_email=$(git show -s --format=%ae "$object_changed")
+          author_date=$(git show -s --format=%aI "$object_changed")
+
+          git checkout --detach "$base"
+          git cherry-pick "$object_changed"
+          git cherry-pick "$conflict_state"
+          git reset --soft "$base"
+          cat >/tmp/core-message <<'EOF'
+          vfs: preserve local writes after remote changes
+
+          Backends can return ErrorObjectChanged when a conditional update finds
+          that the remote object no longer matches the version read by rclone.
+
+          Treat this as a terminal writeback conflict and persist the state with
+          the dirty cache entry so restart does not retry the stale upload.
+          EOF
+          sed -i 's/^          //' /tmp/core-message
+          GIT_AUTHOR_NAME="$author_name" GIT_AUTHOR_EMAIL="$author_email" GIT_AUTHOR_DATE="$author_date" git commit -F /tmp/core-message
+          core_head=$(git rev-parse HEAD)
+
+          git cherry-pick "$conflict_resolution"
+          if ! grep -q 'resolving.*chan struct' vfs/vfscache/item.go; then
+            git apply /tmp/conflict-resolution.patch
+          fi
+          gofmt -w vfs/vfscache/item.go vfs/vfscache/conflict.go vfs/vfscache/conflict_test.go
+          git diff --check
+          git add vfs/vfscache/item.go vfs/vfscache/conflict.go vfs/vfscache/conflict_test.go
+          cat >/tmp/resolution-message <<'EOF'
+          vfs: add writeback conflict resolution
+
+          Add RC calls to list writeback conflicts and resolve them by keeping
+          the local, remote, or both revisions.
+
+          Keep-local retries against the current remote object. Keep-both writes
+          the local revision to a device-named conflict file.
+          EOF
+          sed -i 's/^          //' /tmp/resolution-message
+          git commit --amend -F /tmp/resolution-message
+          resolution_head=$(git rev-parse HEAD)
+
+          git cherry-pick "$onedrive"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("backend/onedrive/onedrive.go")
+          s = p.read_text()
+          old = 'if o.etag != "" && resp != nil && resp.StatusCode == http.StatusPreconditionFailed {'
+          new = 'if o.id != "" && o.etag != "" && resp != nil && resp.StatusCode == http.StatusPreconditionFailed {'
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif new not in s:
+              raise SystemExit("OneDrive precondition guard not found")
+          p.write_text(s)
+
+          p = Path("backend/onedrive/onedrive_test.go")
+          s = p.read_text()
+          old = 'o := &Object{etag: `"etag"`}'
+          new = 'o := &Object{id: "item", etag: `"etag"`}'
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif new not in s:
+              raise SystemExit("OneDrive precondition test object not found")
+          p.write_text(s)
+          PY
+          gofmt -w backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go
+          git diff --check
+          git add backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go
+          cat >/tmp/onedrive-message <<'EOF'
+          onedrive: prevent overwriting files changed remotely
+
+          Keep the eTag from DriveItem metadata and send it with If-Match when
+          updating existing file content or modification time.
+
+          Return ErrorObjectChanged when Microsoft Graph rejects a stale update
+          with HTTP 412 so VFS can preserve the local cached revision.
+          EOF
+          sed -i 's/^          //' /tmp/onedrive-message
+          git commit --amend -F /tmp/onedrive-message
+          onedrive_head=$(git rev-parse HEAD)
+
+          test -z "$(gofmt -l fs/fs.go vfs/vfscache/writeback/writeback.go vfs/vfscache/writeback/writeback_test.go vfs/vfscache/item.go vfs/vfscache/conflict_state_test.go vfs/vfscache/conflict.go vfs/vfscache/conflict_test.go vfs/rc_conflict.go vfs/rc_conflict_test.go backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go)"
+          git diff --check "$base"
+          go test ./fs ./vfs/vfscache/writeback ./vfs/vfscache ./vfs ./backend/onedrive
+          go test -race ./vfs/vfscache/... ./vfs
+          go vet ./fs ./vfs/vfscache/writeback ./vfs/vfscache ./vfs ./backend/onedrive
+          go build
+          make quicktest
+
+          git push --force origin "$core_head":refs/heads/vfs-object-changed
+          git push --force origin "$resolution_head":refs/heads/vfs-conflict-resolution
+          git push --force origin "$onedrive_head":refs/heads/onedrive-etag-preconditions
