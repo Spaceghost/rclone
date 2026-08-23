@@ -1,0 +1,55 @@
+name: temporary OneDrive live readiness
+
+on:
+  pull_request:
+    paths:
+      - ".github/tmp-onedrive-live-trigger"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Configure TestOneDrive
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          set -eu
+          mkdir -p "$HOME/.config/rclone"
+          config="$HOME/.config/rclone/rclone.conf"
+          if [ -n "$RCLONE_CONFIG_B64" ]; then
+            printf '%s' "$RCLONE_CONFIG_B64" | base64 --decode >"$config"
+          elif [ -n "$RCLONE_CONFIG_TEXT" ]; then
+            printf '%s\n' "$RCLONE_CONFIG_TEXT" >"$config"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/16/comments" -f body='Live readiness blocked: no `RCLONE_CONFIG_B64` or `RCLONE_CONFIG` repository secret is configured.'
+            echo '::error::No RCLONE_CONFIG_B64 or RCLONE_CONFIG repository secret is configured.'
+            exit 1
+          fi
+          chmod 600 "$config"
+          if ! grep -q '^\[TestOneDrive\]' "$config"; then
+            gh api "repos/$GITHUB_REPOSITORY/issues/16/comments" -f body='Live readiness blocked: the configured rclone file has no `[TestOneDrive]` remote.'
+            echo '::error::The configured rclone file has no [TestOneDrive] remote.'
+            exit 1
+          fi
+      - name: Run OneDrive integration suite
+        run: go run ./fstest/test_all -remotes TestOneDrive: -maxtries 1 -verbose
+      - name: Report success
+        if: success()
+        run: gh api "repos/$GITHUB_REPOSITORY/issues/16/comments" -f body='Live readiness probe passed: `TestOneDrive:` was available and `test_all` completed successfully on this branch.'
+      - name: Report test failure
+        if: failure()
+        run: gh api "repos/$GITHUB_REPOSITORY/issues/16/comments" -f body="Live readiness probe failed. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
