@@ -1,0 +1,111 @@
+name: temporary OneDrive fragment 412 validation
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+      RCLONE_CONFIG: /notfound
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify RED, implement, and update contribution branch
+        run: |
+          set -euxo pipefail
+          git config user.name Spaceghost
+          git config user.email 251370+Spaceghost@users.noreply.github.com
+          git fetch origin vfs-conflict-resolution onedrive-etag-preconditions
+          git checkout -B work origin/onedrive-etag-preconditions
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("backend/onedrive/onedrive_test.go")
+          s = p.read_text()
+          old = '"net/http"\n\t"testing"'
+          new = '"net/http"\n\t"net/http/httptest"\n\t"strings"\n\t"testing"'
+          if s.count(old) != 1:
+              raise SystemExit(f"expected one stdlib import marker, found {s.count(old)}")
+          s = s.replace(old, new)
+          old = '"github.com/rclone/rclone/fstest/fstests"\n'
+          new = old + '\t"github.com/rclone/rclone/lib/pacer"\n\t"github.com/rclone/rclone/lib/rest"\n'
+          if s.count(old) != 1:
+              raise SystemExit(f"expected one rclone import marker, found {s.count(old)}")
+          s = s.replace(old, new)
+          marker = '\n// TestIntegration runs integration tests against the remote\n'
+          test = r'''
+          func TestUploadFragmentObjectChanged(t *testing.T) {
+          	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+          		w.WriteHeader(http.StatusPreconditionFailed)
+          	}))
+          	defer server.Close()
+
+          	ctx := context.Background()
+          	o := &Object{
+          		id:   "item",
+          		etag: `"etag"`,
+          		fs: &Fs{
+          			pacer:  fs.NewPacer(ctx, pacer.NewDefault()),
+          			unAuth: rest.NewClient(server.Client()),
+          		},
+          	}
+          	_, err := o.uploadFragment(ctx, server.URL, 0, 1, strings.NewReader("x"), 1)
+          	require.ErrorIs(t, err, fs.ErrorObjectChanged)
+          }
+
+          '''
+          if s.count(marker) != 1:
+              raise SystemExit(f"expected one test marker, found {s.count(marker)}")
+          p.write_text(s.replace(marker, "\n" + test.lstrip() + marker.lstrip(), 1))
+          PY
+          gofmt -w backend/onedrive/onedrive_test.go
+
+          set +e
+          go test -count=1 ./backend/onedrive -run '^TestUploadFragmentObjectChanged$' >/tmp/red.log 2>&1
+          red=$?
+          set -e
+          cat /tmp/red.log
+          test "$red" -ne 0
+          grep -q 'ErrorObjectChanged' /tmp/red.log
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("backend/onedrive/onedrive.go")
+          s = p.read_text()
+          old = '''\t\tif err != nil {
+          \t\t\treturn shouldRetry(ctx, resp, err)
+          \t\t}
+          \t\tbody, err = rest.ReadBody(resp)
+          '''
+          new = '''\t\tif err != nil {
+          \t\t\treturn o.shouldRetryUpdate(ctx, resp, err)
+          \t\t}
+          \t\tbody, err = rest.ReadBody(resp)
+          '''
+          if s.count(old) != 1:
+              raise SystemExit(f"expected one uploadFragment error path, found {s.count(old)}")
+          p.write_text(s.replace(old, new, 1))
+          PY
+          gofmt -w backend/onedrive/onedrive.go
+          git diff --check
+          go test -count=1 ./backend/onedrive -run '^TestUploadFragmentObjectChanged$'
+          go test ./backend/onedrive
+          go vet ./backend/onedrive
+
+          git add backend/onedrive/onedrive.go backend/onedrive/onedrive_test.go
+          git commit --amend --no-edit
+          test "$(git rev-list --count origin/vfs-conflict-resolution..HEAD)" = 1
+          git push --force origin HEAD:refs/heads/onedrive-etag-preconditions
