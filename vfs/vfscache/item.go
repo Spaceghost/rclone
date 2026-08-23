@@ -71,6 +71,7 @@ type Item struct {
 	beingReset      bool                     // cache cleaner is resetting the cache file, access not allowed
 	graceTimer      *time.Timer              // timer for delayed close after grace period
 	closing         chan struct{}            // non-nil while a grace-period close is tearing the handle down, closed when done
+	resolving       chan struct{}            // non-nil while conflict resolution is in progress, closed when done
 }
 
 // Info is persisted to backing store
@@ -526,12 +527,14 @@ func (item *Item) open(o fs.Object) (err error) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
 
-	// Wait for any in-progress grace-period close to finish so we start
-	// from a fully closed item rather than racing the fd teardown.
-	for item.closing != nil {
-		closing := item.closing
+	// Wait for close or conflict resolution to release the item.
+	for item.closing != nil || item.resolving != nil {
+		wait := item.closing
+		if wait == nil {
+			wait = item.resolving
+		}
 		item.mu.Unlock()
-		<-closing
+		<-wait
 		item.mu.Lock()
 	}
 
