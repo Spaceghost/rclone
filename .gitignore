@@ -1,0 +1,6 @@
+.idea/
+.vscode/
+.cache/
+bin/
+coverage.out
+projectiond.exe
