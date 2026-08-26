@@ -6,13 +6,12 @@ func TestLoad(t *testing.T) {
 	source := []byte(`package projection
 manifest: {
   version: "v1alpha1"
-  upstreams: docs: {kind: "http", baseURL: "https://example.test/objects/"}
+  upstreams: docs: remote: "docs-source:"
   routes: [{
     name: "docs"
     match: {kind: "prefix", path: "/docs/"}
     target: {upstream: "docs", path: "public"}
-    delivery: mode: "proxy"
-    cache: {mode: "read-through", ttl: "5m"}
+    access: "read-only"
   }]
 }`)
 
@@ -29,17 +28,39 @@ func TestLoadRejectsTraversal(t *testing.T) {
 	source := []byte(`package projection
 manifest: {
   version: "v1alpha1"
-  upstreams: docs: {kind: "rclone", remote: "archive"}
+  upstreams: docs: remote: "archive:"
   routes: [{
     name: "escape"
     match: {kind: "exact", path: "/secret"}
     target: {upstream: "docs", path: "../secret"}
-    delivery: mode: "proxy"
-    cache: mode: "disabled"
+    access: "read-only"
   }]
 }`)
 
 	if _, err := Load(source, "test.cue"); err == nil {
 		t.Fatal("expected traversal to be rejected")
+	}
+}
+
+func TestLoadRejectsFileDirectoryCollision(t *testing.T) {
+	source := []byte(`package projection
+manifest: {
+  version: "v1alpha1"
+  upstreams: docs: remote: "archive:"
+  routes: [{
+    name: "file"
+    match: {kind: "exact", path: "/docs"}
+    target: {upstream: "docs", path: "README.md"}
+    access: "read-only"
+  }, {
+    name: "child"
+    match: {kind: "exact", path: "/docs/child.txt"}
+    target: {upstream: "docs", path: "child.txt"}
+    access: "read-only"
+  }]
+}`)
+
+	if _, err := Load(source, "test.cue"); err == nil {
+		t.Fatal("expected file/directory collision to be rejected")
 	}
 }

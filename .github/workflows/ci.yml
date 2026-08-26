@@ -27,5 +27,5 @@ jobs:
         run: go test ./...
       - name: Vet
         run: go vet ./...
-      - name: Build daemon
-        run: go build ./cmd/projectiond
+      - name: Build rclone with projection backend
+        run: go build .

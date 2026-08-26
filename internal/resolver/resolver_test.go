@@ -12,7 +12,7 @@ func TestStaticResolverUsesExactThenLongestPrefix(t *testing.T) {
 	m := model.Manifest{
 		Version: "v1alpha1",
 		Upstreams: map[string]model.Upstream{
-			"archive": {Kind: "rclone", Remote: "archive"},
+			"archive": {Remote: "archive:"},
 		},
 		Routes: []model.Route{
 			route("fallback", "prefix", "/", "root"),
@@ -47,7 +47,7 @@ func TestStaticResolverUsesExactThenLongestPrefix(t *testing.T) {
 func TestStaticResolverRejectsUncleanPath(t *testing.T) {
 	m := model.Manifest{
 		Version:   "v1alpha1",
-		Upstreams: map[string]model.Upstream{"archive": {Kind: "rclone"}},
+		Upstreams: map[string]model.Upstream{"archive": {Remote: "archive:"}},
 		Routes:    []model.Route{route("all", "prefix", "/", "root")},
 	}
 	r, err := NewStatic(m)
@@ -61,10 +61,9 @@ func TestStaticResolverRejectsUncleanPath(t *testing.T) {
 
 func route(name, kind, matchPath, targetPath string) model.Route {
 	return model.Route{
-		Name:     name,
-		Match:    model.Match{Kind: kind, Path: matchPath},
-		Target:   model.Target{Upstream: "archive", Path: targetPath},
-		Delivery: model.Delivery{Mode: "proxy"},
-		Cache:    model.Cache{Mode: "disabled"},
+		Name:   name,
+		Match:  model.Match{Kind: kind, Path: matchPath},
+		Target: model.Target{Upstream: "archive", Path: targetPath},
+		Access: "read-only",
 	}
 }

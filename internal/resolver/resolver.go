@@ -68,7 +68,6 @@ func (r *Static) resolution(route model.Route, projectionPath, suffix string) mo
 		Path:      projectionPath,
 		Target:    target,
 		Upstream:  r.manifest.Upstreams[target.Upstream],
-		Delivery:  route.Delivery,
-		Cache:     route.Cache,
+		Access:    route.Access,
 	}
 }

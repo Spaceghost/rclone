@@ -1,18 +1,16 @@
 package projection
 
-// A standalone static manifest. Credentials are intentionally absent; adapters
-// will obtain them from their configured credential providers.
+// A standalone static manifest. Each upstream is another configured rclone
+// remote, so credentials and transport behavior remain owned by rclone.
 manifest: {
 	version: "v1alpha1"
 
 	upstreams: {
 		docs: {
-			kind:    "http"
-			baseURL: "https://example.invalid/objects/"
+			remote: ":local:"
 		}
 		archive: {
-			kind:   "rclone"
-			remote: "archive"
+			remote: ":local:"
 		}
 	}
 
@@ -24,10 +22,9 @@ manifest: {
 		}
 		target: {
 			upstream: "docs"
-			path:     "readme.txt"
+			path:     "README.md"
 		}
-		delivery: mode: "redirect"
-		cache: mode: "disabled"
+		access: "read-only"
 	}, {
 		name: "public-archive"
 		match: {
@@ -36,12 +33,8 @@ manifest: {
 		}
 		target: {
 			upstream: "archive"
-			path:     "published"
+			path:     "docs"
 		}
-		delivery: mode: "proxy"
-		cache: {
-			mode: "read-through"
-			ttl:  "15m"
-		}
+		access: "read-only"
 	}]
 }

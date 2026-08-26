@@ -1,19 +1,21 @@
 # Manifest reference: `v1alpha1`
 
-A standalone CUE file must expose a concrete top-level `manifest` value.
+A standalone CUE file exposes one concrete top-level `manifest` value.
 
-- `upstreams`: named `rclone`, `http`, or `s3` declarations. Authentication is
-  external to the manifest.
-- `routes[].match.kind`: `exact` or `prefix`. Prefix paths other than `/` end
-  with `/`; the unmatched suffix is appended to the target path.
-- `routes[].target`: names an upstream and a relative, non-traversing path.
-- `routes[].delivery.mode`: `proxy` or `redirect` policy intent.
-- `routes[].cache.mode`: `disabled`, `read-through`, `write-through`, or
-  `write-back`; write modes are reserved and not executable in the initial
-  runtime.
-- `routes[].cache.ttl`: optional Go duration such as `15m`.
+- `upstreams.<name>.remote` is an rclone remote specification such as
+  `archive:` or `media:bucket/prefix`. It may refer to any registered backend.
+- `routes[].match.kind` is `exact` or `prefix`. Prefix paths other than `/` end
+  in `/`; the unmatched suffix is appended to the target path.
+- `routes[].target.upstream` names a manifest upstream.
+- `routes[].target.path` is clean, relative, and cannot escape the upstream root.
+- `routes[].access` must be `read-only` in `v1alpha1`.
 
-Exact matches win. Otherwise the longest prefix wins. Duplicate match paths and
-route names are rejected, as are non-clean paths and target traversal.
+Exact routes win, followed by the longest matching prefix. Duplicate matches,
+file/directory collisions, unclean visible paths, and target traversal fail
+remote construction.
+
+Manifest files do not contain credentials, HTTP delivery modes, S3 credentials,
+or VFS cache settings. Those belong to rclone remote configuration and command
+flags.
 
 See [`examples/basic/projection.cue`](../examples/basic/projection.cue).

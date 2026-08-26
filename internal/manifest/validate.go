@@ -2,19 +2,11 @@ package manifest
 
 import (
 	"fmt"
-	"net/url"
 	"path"
 	"strings"
-	"time"
 
 	"github.com/Spaceghost/rclone-projection-vfs/internal/model"
 )
-
-var supportedUpstreams = map[string]bool{"rclone": true, "http": true, "s3": true}
-var supportedDelivery = map[string]bool{"proxy": true, "redirect": true}
-var supportedCache = map[string]bool{
-	"disabled": true, "read-through": true, "write-through": true, "write-back": true,
-}
 
 func Validate(m model.Manifest) error {
 	if m.Version != "v1alpha1" {
@@ -27,14 +19,8 @@ func Validate(m model.Manifest) error {
 		if name == "" {
 			return fmt.Errorf("upstream name cannot be empty")
 		}
-		if !supportedUpstreams[upstream.Kind] {
-			return fmt.Errorf("upstream %q has unsupported kind %q", name, upstream.Kind)
-		}
-		if upstream.Kind == "http" {
-			parsed, err := url.Parse(upstream.BaseURL)
-			if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-				return fmt.Errorf("HTTP upstream %q requires an absolute baseURL", name)
-			}
+		if strings.TrimSpace(upstream.Remote) == "" {
+			return fmt.Errorf("upstream %q requires an rclone remote", name)
 		}
 	}
 
@@ -84,15 +70,23 @@ func Validate(m model.Manifest) error {
 		if err := validateTargetPath(route.Target.Path); err != nil {
 			return fmt.Errorf("route %q target path: %w", route.Name, err)
 		}
-		if !supportedDelivery[route.Delivery.Mode] {
-			return fmt.Errorf("route %q has unsupported delivery mode %q", route.Name, route.Delivery.Mode)
+		if route.Access != "read-only" {
+			return fmt.Errorf("route %q access must be read-only in v1alpha1", route.Name)
 		}
-		if !supportedCache[route.Cache.Mode] {
-			return fmt.Errorf("route %q has unsupported cache mode %q", route.Name, route.Cache.Mode)
+	}
+	for exactPath := range exactPaths {
+		ancestorPrefix := exactPath + "/"
+		if exactPath == "/" {
+			ancestorPrefix = "/"
 		}
-		if route.Cache.TTL != "" {
-			if _, err := time.ParseDuration(route.Cache.TTL); err != nil {
-				return fmt.Errorf("route %q has invalid cache ttl: %w", route.Name, err)
+		for otherExact := range exactPaths {
+			if otherExact != exactPath && strings.HasPrefix(otherExact, ancestorPrefix) {
+				return fmt.Errorf("exact file path %q conflicts with descendant route %q", exactPath, otherExact)
+			}
+		}
+		for prefixPath := range prefixPaths {
+			if strings.HasPrefix(prefixPath, ancestorPrefix) {
+				return fmt.Errorf("exact file path %q conflicts with descendant route %q", exactPath, prefixPath)
 			}
 		}
 	}

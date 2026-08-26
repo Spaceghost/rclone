@@ -1,45 +1,61 @@
-# rclone-projection-vfs
+# rclone projection backend
 
-`rclone-projection-vfs` is an experimental programmable projection layer for
-presenting objects from multiple upstreams as one declarative virtual tree. It
-is new, private work: this repository is intentionally independent of
-[`Spaceghost/rclone`](https://github.com/Spaceghost/rclone) and does not modify
-or fork that repository.
+This repository is a pre-integration staging harness for an rclone backend named
+`projection`. The deliverable is not a competing VFS: it is an rclone remote
+that maps a declarative CUE tree onto other configured rclone remotes.
 
-The first safety boundary is deliberately small:
-
-- manifests are CUE files containing a concrete `manifest` value;
-- routes are static exact or prefix matches;
-- one resolver result is shared by protocol adapters;
-- upstream kinds are declared but I/O backends are not yet implemented;
-- HTTP currently exposes a read-only resolution API, not file proxying;
-- Lua or another restricted scripting runtime is deferred until the static
-  manifest and conformance suites are trustworthy.
-
-## Quick start
+The backend participates in normal rclone commands and integrations:
 
 ```powershell
-go run ./cmd/projectiond -manifest ./examples/basic/projection.cue
-Invoke-RestMethod 'http://127.0.0.1:8080/v1/resolve?path=/docs/readme.txt'
+go build -o rclone-projection.exe .
+./rclone-projection.exe config create projected projection manifest=examples/basic/projection.cue
+./rclone-projection.exe lsf projected:
+./rclone-projection.exe copy projected: local-copy:
+./rclone-projection.exe mount projected: X: --read-only
+./rclone-projection.exe serve http projected: --read-only
+./rclone-projection.exe serve s3 projected: --read-only
 ```
 
-The daemon also exposes `GET /healthz`. A missing or invalid manifest fails at
-startup. See [the architecture](docs/architecture.md), [manifest reference](docs/manifest.md),
-and [backlog](docs/backlog.md) for boundaries and planned work.
+The custom binary is rclone with one out-of-tree backend imported, following
+rclone's supported out-of-tree pattern. HTTP, S3, mount, RC, filtering,
+bandwidth control, and VFS caching remain rclone responsibilities.
+
+## Current safety boundary
+
+- one standalone CUE manifest is loaded at remote construction;
+- upstreams are ordinary rclone remote specifications;
+- static exact-file and longest-prefix routes are supported;
+- `NewObject`, directory listing, object metadata, ranges, and reads delegate to
+  the selected upstream object;
+- all mutations fail with rclone's permission-denied error;
+- scripting, embedded manifests, reload, writes, and advanced optional features
+  remain backlog work.
+
+rclone v1.75 logs `no overview data found for "projection"` for an out-of-tree
+backend because backend overview data is embedded in the rclone module. The
+warning is non-fatal in this staging build; adding
+`docs/data/backends/projection.yaml` in the in-tree feature branch removes it.
 
 ## Development
 
 ```powershell
 go test ./...
 go vet ./...
-go build ./cmd/projectiond
+go build .
 ```
 
-CI runs the same checks on GitHub-hosted Ubuntu and Windows runners. No
-self-hosted runner is configured.
+CI uses GitHub-hosted Ubuntu and Windows runners. No self-hosted runner is
+configured or claimed.
 
-## Status
+## Repository route
 
-This is an initial development program, not a production VFS. In particular,
-mounting, upstream I/O, S3 compatibility, redirects, proxying, caching, writes,
-embedded-manifest discovery, and dynamic scripting remain backlog items.
+The recommended integration destination is a feature branch in
+`Spaceghost/rclone`, with the package moved to `backend/projection`, registered
+in `backend/all`, documented, and exercised by rclone's backend test suite.
+That public fork has not been altered. If development must remain private before
+an upstream discussion, use a private mirror of the full rclone repository and
+later move the backend commits onto the public fork; do not ship this staging
+harness as an unrelated storage product.
+
+See [architecture](docs/architecture.md), [manifest](docs/manifest.md),
+[integration route](docs/integration.md), and [backlog](docs/backlog.md).

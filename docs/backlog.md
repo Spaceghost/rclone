@@ -1,42 +1,37 @@
-# Initial development backlog
+# Initial rclone-backend backlog
 
-The machine-readable source for publishing these items as GitHub issues is
-[`backlog/issues.json`](../backlog/issues.json). Priorities describe sequencing,
-not promises of completion.
+The machine-readable issue source is
+[`backlog/issues.json`](../backlog/issues.json).
 
-## Core resolver and backends
+## P0: backend correctness
 
-- **P0 — Manifest schema and discovery:** formal CUE constraints, standalone
-  loading, embedded/adjacent discovery, precedence, atomic reload, diagnostics.
-- **P0 — Resolver conformance:** exact, prefix, future pattern matching,
-  deterministic ordering, path encoding, metadata, negative and fuzz tests.
-- **P0 — Backend contracts:** common errors, range reads, stat/list capability,
-  redirect capability, cancellation, retries, observability.
-- **P1 — Upstreams:** rclone remote adapter, HTTP adapter, and S3 adapter with a
-  shared conformance suite.
-- **P1 — Cache:** bounded read-through cache first; only then specify and build
-  write-through/write-back durability and recovery.
-- **P2 — Restricted dynamic resolver RFC:** sandbox and resource limits before
-  choosing Lua or another runtime.
+- Formalize the CUE schema, manifest diagnostics, config options, and safe
+  reload behavior.
+- Make `List`, `NewObject`, root scoping, Unicode, path encoding, exact overlays,
+  and longest-prefix routing pass one conformance matrix.
+- Preserve upstream object metadata, hashes, MIME types, ranges, mandatory open
+  options, cancellation, and canonical rclone errors.
+- Add unit, fuzz, and `fstest` integration coverage against real configured
+  remotes.
 
-## HTTP adapter
+## P1: rclone capabilities
 
-- **P0 — Object gateway:** GET/HEAD/range/conditional requests using the core
-  resolver, with explicit redirect-versus-proxy fallback behavior.
-- **P1 — Operations:** structured errors, request IDs, metrics, tracing, reload
-  health, and security limits.
+- Define route-specific write ownership and implement `Put`, `Update`, `Remove`,
+  `Mkdir`, and `Rmdir` without partial or cross-route ambiguity.
+- Advertise `ListR`, copy/move, directory move, purge, public link, metadata,
+  change notification, shutdown, and usage only when upstream capability
+  negotiation is correct.
+- Validate standard `copy`, `sync`, `bisync`, `check`, `lsjson`, `mount`, RC,
+  `serve http`, and `serve s3` workflows.
+- Specify how rclone VFS cache modes interact with projected writes before
+  considering backend-specific write-through or write-back behavior.
 
-## S3 adapter
+## P2: programmability and contribution
 
-- **P0 — Read-only surface:** GetObject, HeadObject, and listing semantics over
-  the same resolver; document path/key normalization and error translation.
-- **P1 — Compatibility:** signed requests, multipart/range behavior, conformance
-  tests against common SDKs, and capability-driven redirect/proxy behavior.
-- **P2 — Writes:** only after cache/write consistency semantics are approved.
-
-## Desktop and mount
-
-- **P1 — Mount spike:** evaluate WinFsp, FUSE, and rclone integration boundaries;
-  measure cancellation, random reads, directory enumeration, and unmount safety.
-- **P2 — Desktop control plane:** manifest selection, validation diagnostics,
-  status, logs, cache controls, safe credential-provider integration, upgrades.
+- Add embedded/adjacent manifest discovery with deterministic shadowing and
+  atomic reload.
+- Write a sandbox RFC before selecting Lua or another restricted dynamic
+  resolver.
+- Move the package into a confirmed `Spaceghost/rclone` feature branch, add
+  rclone docs/registration/test configuration, and open an upstream design
+  discussion before a merge request.

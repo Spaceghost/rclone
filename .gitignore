@@ -3,4 +3,4 @@
 .cache/
 bin/
 coverage.out
-projectiond.exe
+rclone-projection.exe

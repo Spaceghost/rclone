@@ -1,72 +1,67 @@
 [
   {
-    "title": "Core: formalize v1alpha1 CUE schema and manifest discovery",
-    "labels": ["area:core", "priority:p0"],
-    "body": "Define formal CUE constraints and implement standalone plus embedded/adjacent manifest discovery. Specify precedence, shadowing, atomic reload, metadata visibility, and actionable diagnostics.\n\nAcceptance: deterministic discovery tests cover conflicts, invalid children, reload failure, and Windows/Unix path forms."
+    "title": "projection: formalize CUE schema and rclone config lifecycle",
+    "labels": ["area:projection", "priority:p0"],
+    "body": "Define the CUE schema, manifest path/config options, credential boundaries, diagnostics, reload atomicity, and self-reference detection. Acceptance: invalid or cyclic configuration fails remote construction without changing upstreams."
   },
   {
-    "title": "Core: build resolver conformance and fuzz suite",
-    "labels": ["area:core", "priority:p0"],
-    "body": "Expand exact/longest-prefix coverage into a protocol-neutral conformance suite. Include escaping, encoding, Unicode, traversal, route ambiguity, cancellation, and fuzz cases.\n\nAcceptance: every protocol adapter consumes the same resolver cases without reimplementing matching."
+    "title": "projection: make List and NewObject share one path conformance matrix",
+    "labels": ["area:projection", "priority:p0"],
+    "body": "Cover root scoping, exact overlays, longest prefixes, synthesized directories, collisions, Unicode, encoding, traversal, and missing upstream objects. Acceptance: listing an object and direct lookup yield the same visible identity and canonical rclone errors."
   },
   {
-    "title": "Core: stabilize backend capability and error contracts",
-    "labels": ["area:backend", "priority:p0"],
-    "body": "Define stat, range-read, list, redirect, retry, cancellation, and common-error contracts. Keep credentials outside manifests.\n\nAcceptance: fake backend conformance tests prove capability fallback and error translation."
+    "title": "projection: preserve read metadata, hashes, ranges, and open options",
+    "labels": ["area:projection", "priority:p0"],
+    "body": "Delegate object metadata and reads without losing MIME type, hashes, timestamps, size, range/seek semantics, mandatory options, cancellation, or errors. Acceptance: backend conformance tests pass across representative upstream types."
   },
   {
-    "title": "Backend: implement rclone remote adapter",
-    "labels": ["area:backend", "priority:p1"],
-    "body": "Implement the backend contracts over rclone remotes without modifying Spaceghost/rclone. Decide library, subprocess, or RPC boundary explicitly.\n\nAcceptance: passes the shared backend conformance suite and documents credential/config isolation."
+    "title": "projection: add fuzz and fstest integration coverage",
+    "labels": ["area:testing", "priority:p0"],
+    "body": "Add parser/resolver fuzzing and rclone fstest coverage with maintained test remotes. Acceptance: document clean backend unit tests and fstest/test_all results; a local pass is not a hosted CI claim."
   },
   {
-    "title": "Backend: implement HTTP upstream adapter",
-    "labels": ["area:backend", "priority:p1"],
-    "body": "Implement stat and range reads for HTTP upstreams with redirect safety, conditional requests, bounded retries, and cancellation.\n\nAcceptance: passes the shared backend conformance suite against a deterministic test server."
+    "title": "projection: specify route write ownership and conflict behavior",
+    "labels": ["area:writes", "priority:p0"],
+    "body": "Define which route owns a new path, overwrite behavior, exact-route writes, directory creation, cross-route moves, conflicts, and rollback. Acceptance: approved failure matrix precedes mutation support."
   },
   {
-    "title": "Backend: implement S3 upstream adapter",
-    "labels": ["area:backend", "priority:p1"],
-    "body": "Implement S3-backed reads and optional presigning using external credential providers.\n\nAcceptance: passes the shared backend conformance suite and a local S3-compatible integration suite."
+    "title": "projection: implement core write operations",
+    "labels": ["area:writes", "priority:p1"],
+    "body": "Implement Put, Object.Update, Object.Remove, Mkdir, and Rmdir after write ownership is approved. Acceptance: no unsupported write consumes input or changes an upstream; fstest mutation cases pass."
   },
   {
-    "title": "HTTP: serve objects with redirect and proxy policy",
-    "labels": ["area:http", "priority:p0"],
-    "body": "Turn resolver results into GET/HEAD/range responses. Honor redirect intent only when the backend can return a safe bounded URL; otherwise proxy.\n\nAcceptance: tests cover ranges, validators, content metadata, method limits, redirects, fallback, cancellation, and upstream error mapping."
+    "title": "projection: negotiate optional rclone backend features",
+    "labels": ["area:compatibility", "priority:p1"],
+    "body": "Add ListR, Copy, Move, DirMove, Purge, PublicLink, metadata, change notification, shutdown, and usage only when routed upstream capabilities are sound. Acceptance: every advertised feature has positive and fallback tests."
   },
   {
-    "title": "S3: implement read-only protocol facade",
-    "labels": ["area:s3", "priority:p0"],
-    "body": "Expose GetObject, HeadObject, and listing semantics over the shared resolver. Define bucket/key mapping and S3 error translation.\n\nAcceptance: AWS SDK integration tests exercise pagination, prefixes, ranges, missing keys, and encoded keys."
+    "title": "projection: validate standard rclone command compatibility",
+    "labels": ["area:compatibility", "priority:p1"],
+    "body": "Exercise copy, sync, bisync, check, lsjson, mount, filtering, RC, and config flows. Acceptance: compatibility table records command, platform, configuration, result, and remaining limitation."
   },
   {
-    "title": "Cache: implement bounded read-through cache",
+    "title": "projection: validate rclone serve HTTP and S3 behavior",
+    "labels": ["area:serve", "priority:p1"],
+    "body": "Test serve http and serve s3 over the same projection remote, including ranges, listings, errors, auth, and read-only enforcement. Acceptance: use standard rclone servers; do not add a parallel gateway."
+  },
+  {
+    "title": "projection: specify VFS cache and projected write interaction",
     "labels": ["area:cache", "priority:p1"],
-    "body": "Specify cache keys, validation, eviction, partial objects, stampede control, and crash cleanup before implementing read-through caching.\n\nAcceptance: deterministic tests cover stale data, concurrent misses, bounds, restart, and bypass."
+    "body": "Document VFS cache modes, retries, visibility, flush, conflicts, crash recovery, and route changes. Acceptance: approved semantics precede any backend write-through or write-back implementation."
   },
   {
-    "title": "Cache: specify write-through and write-back durability",
-    "labels": ["area:cache", "priority:p2"],
-    "body": "Write an RFC for commit point, conflicts, retries, queue persistence, fsync boundaries, recovery, visibility, and operator controls.\n\nAcceptance: approved failure matrix and recovery test plan precede executable write support."
+    "title": "projection: design embedded manifest discovery and atomic reload",
+    "labels": ["area:projection", "priority:p2"],
+    "body": "Define embedded/adjacent manifest placement, precedence, shadowing, visibility, watches, and atomic reload. Acceptance: deterministic tests cover conflicts and partial failures."
   },
   {
-    "title": "Desktop: evaluate mount integration and unmount safety",
-    "labels": ["area:desktop", "priority:p1"],
-    "body": "Spike WinFsp/FUSE and possible rclone integration boundaries. Measure enumeration, random/range reads, cancellation, reconnect, and forced unmount.\n\nAcceptance: written recommendation includes benchmark evidence and failure behavior; no production claim from a demo mount."
+    "title": "projection: write restricted dynamic resolver RFC",
+    "labels": ["area:scripting", "priority:p2"],
+    "body": "Compare Lua with restricted alternatives and define CPU, memory, recursion, output, filesystem, network, time/randomness, and observability limits. Acceptance: scripts only emit a validated route resolution and cannot call upstreams."
   },
   {
-    "title": "Desktop: design control plane and diagnostics",
-    "labels": ["area:desktop", "priority:p2"],
-    "body": "Design manifest selection, validation, live status, logs, cache controls, credential-provider integration, mount lifecycle, and upgrades.\n\nAcceptance: threat model and UX flows cover invalid manifests, lost upstreams, cache pressure, and safe shutdown."
-  },
-  {
-    "title": "RFC: restricted dynamic route resolution",
-    "labels": ["area:core", "priority:p2"],
-    "body": "Compare restricted Lua with alternatives only after the static core is stable. Define CPU, memory, recursion, output, filesystem, network, time/randomness, and observability limits.\n\nAcceptance: scripts can only emit a validated Resolution and cannot perform upstream I/O directly."
-  },
-  {
-    "title": "CI: add protocol integration and compatibility matrix",
-    "labels": ["area:ci", "priority:p1"],
-    "body": "Extend unit CI with race tests, fuzz smoke tests, local HTTP/S3 fixtures, SDK compatibility, and release artifacts.\n\nAcceptance: required checks have bounded runtime and document which jobs use GitHub-hosted runners."
+    "title": "projection: prepare Spaceghost/rclone feature branch integration",
+    "labels": ["area:contribution", "priority:p1"],
+    "body": "After the repository route is confirmed, move code to backend/projection, register it in backend/all, add backend docs/data and fstest config, and follow rclone AGENTS/CONTRIBUTING guidance. Acceptance: no public fork changes occur before confirmation."
   }
 ]

@@ -1,40 +1,61 @@
 # Architecture
 
-## Invariants
+## Position in rclone
 
-1. A visible path resolves to a protocol-neutral plan before any upstream I/O.
-2. HTTP, S3, and mount adapters consume the same resolver contract.
-3. Manifest evaluation is deterministic and fail-closed in the static phase.
-4. Credentials never belong in the projection manifest.
-5. A requested redirect may degrade to proxy when the backend cannot safely
-   create a bounded URL; it must not expose credentials.
-6. Write-through and write-back modes are configuration intent only until
-   durability, conflict, retry, and recovery semantics have conformance tests.
-
-## Flow
+`projection` is an overlay backend implementing rclone's `fs.Fs` and
+`fs.Object` contracts. A manifest resolves visible paths to another rclone
+remote and a relative object path. The backend delegates object operations to
+that upstream filesystem.
 
 ```text
-CUE source -> manifest loader -> validated model -> resolver -> Resolution
-                                                             /     |      \
-                                                         HTTP     S3     mount
-                                                             \     |      /
-                                                               backends
-                                                     rclone / HTTP / S3
+rclone command / mount / serve http / serve s3
+                       |
+                 projection fs.Fs
+                       |
+              CUE manifest + resolver
+                       |
+        configured rclone upstream fs.Fs instances
+          local / S3 / HTTP / any other backend
 ```
 
-The initial implementation stops after producing `Resolution`. Its HTTP API is
-an inspection surface for this result, not yet an object-serving gateway.
+There is no separate HTTP or S3 gateway. `rclone serve http projection:` and
+`rclone serve s3 projection:` consume the same backend through standard rclone
+interfaces. Likewise, desktop mounting is `rclone mount projection:` and cache
+behavior is controlled by rclone/VFS flags and wrapper backends.
 
-## Manifest placement
+## Phase-one semantics
 
-Phase 1 accepts one standalone CUE file. A later discovery layer will support a
-root manifest plus files embedded in or adjacent to visible directories. That
-layer must specify precedence, shadowing, cycles, reload atomicity, error
-reporting, and whether metadata files themselves are visible.
+The backend registers through `fs.Register`, receives its manifest path through
+the normal config mapper, and constructs manifest upstreams through rclone's
+filesystem cache. It advertises itself as an overlay.
 
-## Dynamic resolution
+`NewObject` resolves one exact or longest-prefix route and wraps the upstream
+object with the visible remote name. `List` delegates within a prefix route and
+synthesizes ancestor directories or exact-file entries required by the
+manifest. More-specific manifest entries override delegated directory entries.
 
-Dynamic routes are postponed. Before adopting Lua or another restricted
-runtime, an RFC must define CPU, memory, recursion, output, filesystem, network,
-and clock/randomness limits. Script output must still produce the same validated
-`Resolution` shape and cannot directly perform upstream I/O.
+Phase one is read-only. Although `fs.Fs` requires mutation methods, they return
+`fs.ErrorPermissionDenied`. The backend does not claim server-side copy/move,
+recursive listing, public links, metadata propagation, change notification, or
+write support until each capability has rclone conformance tests.
+
+## Invariants
+
+1. All upstreams are rclone remotes; credentials stay in rclone configuration.
+2. Resolution is deterministic and performs no I/O.
+3. Visible paths and target paths are clean and cannot traverse roots.
+4. Listing and direct lookup must agree on the same visible object identity.
+5. Unsupported writes fail before consuming input or changing an upstream.
+6. Optional rclone features are advertised only when their semantics are proven.
+7. Scripting can emit only a validated resolution and cannot call upstreams.
+
+## Cache and delivery
+
+Redirect-versus-proxy is not a core manifest concern. A future `PublicLink`
+capability may delegate to upstreams where rclone consumers can use it safely,
+but `serve` behavior remains owned by rclone.
+
+Read/write caching should first reuse rclone's VFS cache and cache-related
+backends. Any backend-level write-through or write-back design needs an rclone
+semantics RFC covering commit points, conflicts, retry, recovery, and interaction
+with `mount` before implementation.
