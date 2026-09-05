@@ -1,0 +1,147 @@
+diff --git a/backend/local/atomic_commit_linux.go b/backend/local/atomic_commit_linux.go
+index 989f4fe..d9b2b15 100644
+--- a/backend/local/atomic_commit_linux.go
++++ b/backend/local/atomic_commit_linux.go
+@@ -76,7 +76,10 @@ func (f *Fs) StartAtomicCommit(ctx context.Context, remote string) (fs.AtomicCo
+ 		return closeOnError(fs.ErrorCantAtomicCommit)
+ 	}
+ 
+-	commit := &xfsAtomicCommit{dst: dst, f: f}
++	commit := &xfsAtomicCommit{
++		dst:  dst,
++		f:    f,
++		args: xfsCommitRange{Flags: xfsExchangeRangeToEOF | xfsExchangeRangeDsync},
++	}
+ 	if err := xfsIoctl(dst.Fd(), xfsIOCStartCommit, &commit.args); err != nil {
+ 		if errors.Is(err, unix.ENOTTY) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EINVAL) {
+ 			return closeOnError(fs.ErrorCantAtomicCommit)
+@@ -115,7 +118,6 @@ func (c *xfsAtomicCommit) Commit(ctx context.Context, srcRemote string) error {
+ 	}
+ 
+ 	c.args.File1Fd = int32(src.Fd())
+-	c.args.Flags = xfsExchangeRangeToEOF | xfsExchangeRangeDsync
+ 	if err := xfsIoctl(c.dst.Fd(), xfsIOCCommitRange, &c.args); err != nil {
+ 		if errors.Is(err, unix.EBUSY) {
+ 			return fs.ErrorAtomicCommitConflict
+@@ -130,6 +132,34 @@ func (c *xfsAtomicCommit) Commit(ctx context.Context, srcRemote string) error {
+ 	return nil
+ }
+ 
++// AtomicCreate moves srcRemote to dstRemote only if dstRemote does not exist.
++func (f *Fs) AtomicCreate(ctx context.Context, srcRemote, dstRemote string) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	srcObj, err := f.newObject(srcRemote)
++	if err != nil {
++		return err
++	}
++	dstObj, err := f.newObject(dstRemote)
++	if err != nil {
++		return err
++	}
++	err = unix.Renameat2(unix.AT_FDCWD, srcObj.path, unix.AT_FDCWD, dstObj.path, unix.RENAME_NOREPLACE)
++	if err == nil {
++		return nil
++	}
++	if errors.Is(err, unix.EEXIST) {
++		return fs.ErrorAtomicCommitConflict
++	}
++	if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EXDEV) {
++		return fs.ErrorCantAtomicCommit
++	}
++	return err
++}
++
+ // Close releases the destination descriptor held by the prepared commit.
+ func (c *xfsAtomicCommit) Close() error {
+ 	if c.dst == nil {
+@@ -151,3 +181,5 @@ func (c *xfsAtomicCommit) Close() error {
+ 	c.dst = nil
+ 	return err
+ }
++
++var _ fs.AtomicCreator = (*Fs)(nil)
+diff --git a/cmd/serve/s3/backend.go b/cmd/serve/s3/backend.go
+index 370bc77..b277e10 100644
+--- a/cmd/serve/s3/backend.go
++++ b/cmd/serve/s3/backend.go
+@@ -429,9 +429,8 @@ func (b *s3Backend) PutObjectWithConditions(ctx context.Context, bucketName, obj
+ 		return result, err
+ 	}
+ 
+-	// Rename the temporary object into place. On filesystems which support
+-	// guarded atomic replacement, prefer that and fall back to the normal
+-	// move if the destination changed while the upload was in progress.
++	// Publish the temporary object, using backend atomic operations when they
++	// can protect the condition against writers outside this server.
+ 	if tmpFp != fp {
+ 		committed := false
+ 		if atomicCommit != nil {
+@@ -445,10 +444,25 @@ func (b *s3Backend) PutObjectWithConditions(ctx context.Context, bucketName, obj
+ 					return result, removeErr
+ 				}
+ 			} else if errors.Is(err, fs.ErrorAtomicCommitConflict) && conditions != nil {
+ 				cleanup()
+-				return result, gofakes3.ErrPreconditionFailed
+-			} else if !errors.Is(err, fs.ErrorAtomicCommitConflict) && !errors.Is(err, fs.ErrorCantAtomicCommit) {
++				return result, gofakes3.ErrConditionalRequestConflict
++			} else {
+ 				cleanup()
+ 				return result, err
+ 			}
+ 		}
++		if !committed && conditions != nil && conditions.IfNoneMatch == "*" && _vfs.Opt.CacheMode < vfscommon.CacheModeMinimal {
++			if creator, ok := fsys.(fs.AtomicCreator); ok {
++				err = creator.AtomicCreate(ctx, tmpFp, fp)
++				if err == nil {
++					committed = true
++					b.forgetPath(_vfs, fp)
++					b.forgetPath(_vfs, tmpFp)
++				} else if errors.Is(err, fs.ErrorAtomicCommitConflict) {
++					cleanup()
++					return result, gofakes3.ErrConditionalRequestConflict
++				} else if !errors.Is(err, fs.ErrorCantAtomicCommit) {
++					cleanup()
++					return result, err
++				}
++			}
++		}
+ 		if !committed {
+ 			if err := _vfs.Rename(tmpFp, fp); err != nil {
+ 				cleanup()
+diff --git a/cmd/serve/s3/conditional_http_test.go b/cmd/serve/s3/conditional_http_test.go
+index 04eb09f..8e6257a 100644
+--- a/cmd/serve/s3/conditional_http_test.go
++++ b/cmd/serve/s3/conditional_http_test.go
+@@ -60,7 +60,7 @@ func TestS3ConditionalPut(t *testing.T) {
+ 				assert.Equal(t, 412, put("lost update", http.Header{"If-Match": {etag}}).Code)
+ 				assert.Equal(t, "replacement", conditionalRequest(s.handler, http.MethodGet, target, "", nil).Body.String())
+-				assert.Equal(t, 404, conditionalRequest(s.handler, http.MethodPut, target+"-missing", "absent", http.Header{"If-Match": {etag}}).Code)
++				assert.Equal(t, 412, conditionalRequest(s.handler, http.MethodPut, target+"-missing", "absent", http.Header{"If-Match": {etag}}).Code)
+ 				assert.Equal(t, 200, put("exists", http.Header{"If-Match": {"*"}}).Code)
+ 				for _, h := range []http.Header{
+ 					{"If-Match": {""}}, {"If-None-Match": {""}},
+@@ -68,6 +68,7 @@ func TestS3ConditionalPut(t *testing.T) {
+ 					{"If-Match": {etag, etag}}, {"If-None-Match": {"*", "*"}},
+ 					{"If-Match": {"W/" + etag}}, {"If-None-Match": {etag}},
++					{"If-Match": {etag}, "If-None-Match": {"*"}},
+ 				} {
+ 					assert.Equal(t, 400, put("invalid", h).Code)
+ 				}
+diff --git a/fs/atomic_commit.go b/fs/atomic_commit.go
+index 69aa429..54e849f 100644
+--- a/fs/atomic_commit.go
++++ b/fs/atomic_commit.go
+@@ -28,3 +28,10 @@ type AtomicCommitter interface {
+ 	// It returns ErrorCantAtomicCommit when the operation is not available.
+ 	StartAtomicCommit(ctx context.Context, remote string) (AtomicCommit, error)
+ }
++
++// AtomicCreator is an optional interface for filesystems which can publish a
++// staged object without replacing an existing destination.
++type AtomicCreator interface {
++	// AtomicCreate moves srcRemote to dstRemote only when dstRemote is absent.
++	// It returns ErrorAtomicCommitConflict when dstRemote already exists.
++	AtomicCreate(ctx context.Context, srcRemote, dstRemote string) error
++}
