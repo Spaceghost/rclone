@@ -37,18 +37,20 @@ index 337cff5..52f1e79 100644
 +		return result, err
 +	}
  	objectDir := path.Dir(fp)
- 	// _, err = db.fs.Stat(objectDir)
- 	// if err == vfs.ENOENT {
-@@ -420,7 +436,15 @@ func (b *s3Backend) PutObject(
+@@ -420,7 +436,18 @@ func (b *s3Backend) PutObject(
  
  	// Rename the temporary object into place
  	if tmpFp != fp {
 -		if err := _vfs.Rename(tmpFp, fp); err != nil {
+-			cleanup()
+-			return result, err
 +		if conditions != nil {
-+			if used, err := tryXFSCommit(_vfs, tmpFp, fp, n); err != nil {
++			used, err := tryXFSCommit(_vfs, tmpFp, fp, n)
++			if err != nil {
 +				cleanup()
 +				return result, err
-+			} else if used {
++			}
++			if used {
 +				b.forgetPath(_vfs, tmpFp)
 +				tmpFp = fp
 +			}
@@ -58,12 +60,9 @@ index 337cff5..52f1e79 100644
 +				cleanup()
 +				return result, err
 +			}
-+		}
--			cleanup()
--			return result, err
--		}
+ 		}
  	}
-@@ -486,14 +510,18 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
+@@ -486,14 +513,18 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
  	if err != nil {
  		return err
  	}
@@ -83,8 +82,7 @@ index 337cff5..52f1e79 100644
 +	b.rmdirRecursive(ctx, fp, _vfs)
  	return nil
  }
- 
-@@ -552,6 +580,11 @@ func (b *s3Backend) BucketExists(ctx context.Context, name string) (exists bool,
+@@ -552,6 +583,11 @@ func (b *s3Backend) BucketExists(ctx context.Context, name string) (exists bool,
  
  // CopyObject copy specified object from srcKey to dstKey.
  func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, meta map[string]string) (result gofakes3.CopyObjectResult, err error) {
@@ -96,7 +94,7 @@ index 337cff5..52f1e79 100644
  	_vfs, err := b.s.getVFS(ctx)
  	if err != nil {
  		return result, err
-@@ -561,6 +594,14 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
+@@ -561,6 +597,14 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
  		return result, err
  	}
  	if srcBucket == dstBucket && srcKey == dstKey {
@@ -109,9 +107,7 @@ index 337cff5..52f1e79 100644
 +			return result, err
 +		}
  		b.meta.Store(fp, meta)
- 
- 		val, ok := meta["X-Amz-Meta-Mtime"]
-@@ -605,7 +646,7 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
+@@ -605,7 +649,7 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
  	// whose source is being overwritten as it is read - its stated size no
  	// longer matching its readable bytes - fails with IncompleteBody rather
  	// than storing a mixture.
@@ -120,7 +116,7 @@ index 337cff5..52f1e79 100644
  	if err != nil {
  		return
  	}
- diff --git a/cmd/serve/s3/multipart.go b/cmd/serve/s3/multipart.go
+diff --git a/cmd/serve/s3/multipart.go b/cmd/serve/s3/multipart.go
 index 11155ab..224797a 100644
 --- a/cmd/serve/s3/multipart.go
 +++ b/cmd/serve/s3/multipart.go
@@ -246,5 +242,3 @@ index 0d778dc..0d013d1 100644
  	}
 +	b.rmdirRecursive(ctx, dir, VFS)
  }
- 
- func authlistResolver(list []string, error) {
