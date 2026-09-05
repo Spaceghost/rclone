@@ -131,8 +131,8 @@ jobs:
         working-directory: work
         run: |
           set -euo pipefail
-          git apply --check ../patches/rclone-existing-files.patch
-          git apply ../patches/rclone-existing-files.patch
+          git apply --recount --check ../patches/rclone-existing-files.patch
+          git apply --recount ../patches/rclone-existing-files.patch
           cp -a ../patches/rclone-files/. .
           git apply --recount --check ../patches/rclone-cas-compile-fix.patch
           git apply --recount ../patches/rclone-cas-compile-fix.patch
