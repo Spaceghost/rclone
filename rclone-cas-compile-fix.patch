@@ -1,0 +1,13 @@
+diff --git a/cmd/serve/s3/backend.go b/cmd/serve/s3/backend.go
+--- a/cmd/serve/s3/backend.go
++++ b/cmd/serve/s3/backend.go
+@@ -586,7 +586,8 @@ func (b *s3Backend) CopyObjectWithConditions(ctx context.Context, srcBucket, sr
+ 		return result, err
+ 	}
+ 	if srcBucket == dstBucket && srcKey == dstKey {
+-		unlock, err := b.lockObject(ctx, _vfs, fp)
++		var unlock func()
++		unlock, err = b.lockObject(ctx, _vfs, fp)
+ 		if err != nil {
+ 			return result, err
+ 		}
