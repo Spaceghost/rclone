@@ -1,0 +1,54 @@
+diff --git a/conditional.go b/conditional.go
+index 4f2a000..7a7c37a 100644
+--- a/conditional.go
++++ b/conditional.go
+@@ -11,7 +11,9 @@ import (
+ // A zero value imposes no conditions. IfMatch is a single ETag, without
+ // quotes, or "*". IfNoneMatch is either empty or "*".
+ type WriteConditions struct {
+-	IfMatch     string
++	// IfMatch requires a matching ETag, or an existing object for "*".
++	IfMatch string
++	// IfNoneMatch requires an absent object for "*".
+ 	IfNoneMatch string
+ }
+ 
+@@ -68,7 +70,7 @@ func parseWriteConditions(h http.Header) (*WriteConditions, error) {
+ 		if strings.HasPrefix(etag, `"`) && strings.HasSuffix(etag, `"`) && len(etag) >= 2 {
+ 			etag = etag[1 : len(etag)-1]
+ 		}
+-		if etag == "" || strings.ContainsAny(etag, "\" ,\t\r\n") || strings.HasPrefix(etag, "W/") {
++		if etag == "" || etag == "*" || strings.ContainsAny(etag, "\" ,\t\r\n") || strings.HasPrefix(etag, "W/") {
+ 			return nil, ErrorInvalidArgument("If-Match", c.IfMatch, "Expected a single strong ETag")
+ 		}
+ 		c.IfMatch = etag
+diff --git a/conditional_test.go b/conditional_test.go
+index 2605729..21cb838 100644
+--- a/conditional_test.go
++++ b/conditional_test.go
+@@ -1,6 +1,7 @@
+ package gofakes3
+ 
+ import (
++	"context"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"testing"
+@@ -51,6 +52,7 @@ func TestParseWriteConditions(t *testing.T) {
+ 		{"Spaces", http.Header{"If-Match": {" \t\"etag\" \t"}}, &WriteConditions{IfMatch: "etag"}, false},
+ 		{"Wildcard", http.Header{"If-Match": {"*"}}, &WriteConditions{IfMatch: "*"}, false},
+ 		{"Empty", http.Header{"If-Match": {""}}, nil, true},
++		{"QuotedWildcard", http.Header{"If-Match": {`"*"`}}, nil, true},
+ 		{"EmptyQuoted", http.Header{"If-Match": {`""`}}, nil, true},
+ 		{"Weak", http.Header{"If-Match": {`W/"etag"`}}, nil, true},
+ 		{"List", http.Header{"If-Match": {`"a", "b"`}}, nil, true},
+@@ -78,3 +80,9 @@ func TestPreconditionFailedResponse(t *testing.T) {
+ 	assert.Equal(t, http.StatusPreconditionFailed, r.Code)
+ 	assert.Contains(t, r.Body.String(), "<Code>PreconditionFailed</Code>")
+ }
++
++func TestConditionalBackendRequired(t *testing.T) {
++	g := New(nil)
++	_, err := g.putObjectWithConditions(context.Background(), "bucket", "key", nil, nil, 0, &WriteConditions{IfNoneMatch: "*"})
++	require.ErrorIs(t, err, ErrNotImplemented)
++}
