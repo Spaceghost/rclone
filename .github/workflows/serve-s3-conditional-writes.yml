@@ -1,0 +1,62 @@
+name: serve s3 conditional write validation
+
+on:
+  push:
+    branches:
+      - ci/serve-s3-conditional-writes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.repository == 'Spaceghost/rclone'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RCLONE_CONFIG: /notfound
+    steps:
+      - name: Checkout test revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 73119d368f26d62059c0158ee25f0208e12d142a
+          persist-credentials: false
+      - name: Archive source
+        run: |
+          mkdir -p /tmp/cas-results
+          git rev-parse HEAD | tee /tmp/cas-results/revision.txt
+          git archive --format=tar.gz -o /tmp/cas-results/source.tar.gz HEAD
+      - name: Upload source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cas-source
+          path: /tmp/cas-results/source.tar.gz
+          retention-days: 7
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Build
+        run: |
+          set -o pipefail
+          go version | tee /tmp/cas-results/go-version.txt
+          go build 2>&1 | tee /tmp/cas-results/build.txt
+      - name: S3 race tests
+        run: |
+          set -o pipefail
+          go test -race -count=1 -skip '^TestS3Minio$' ./cmd/serve/s3 2>&1 | tee /tmp/cas-results/s3-race.txt
+      - name: Full quicktest baseline
+        if: always()
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          make quicktest 2>&1 | tee /tmp/cas-results/quicktest.txt
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cas-results
+          path: /tmp/cas-results/*.txt
+          retention-days: 14
