@@ -9,6 +9,7 @@ on:
       - gofakes3-conditional-writes.patch
       - gofakes3-conditional-fixes.patch
       - rclone-existing-files.patch
+      - rclone-cas-compile-fix.patch
       - rclone-xfs-atomic-commit.patch
       - rclone-files/**
   workflow_dispatch:
@@ -123,6 +124,8 @@ jobs:
           git apply --check ../patches/rclone-existing-files.patch
           git apply ../patches/rclone-existing-files.patch
           cp -a ../patches/rclone-files/. .
+          git apply --check ../patches/rclone-cas-compile-fix.patch
+          git apply ../patches/rclone-cas-compile-fix.patch
           git apply --check ../patches/rclone-xfs-atomic-commit.patch
           git apply ../patches/rclone-xfs-atomic-commit.patch
           git diff --check
