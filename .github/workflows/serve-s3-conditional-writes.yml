@@ -6,6 +6,11 @@ on:
       - ci/serve-s3-conditional-writes
     paths:
       - .github/workflows/serve-s3-conditional-writes.yml
+      - gofakes3-conditional-writes.patch
+      - gofakes3-conditional-fixes.patch
+      - rclone-existing-files.patch
+      - rclone-xfs-atomic-commit.patch
+      - rclone-files/**
   workflow_dispatch:
 
 permissions:
@@ -70,13 +75,75 @@ jobs:
           git add gofakes3
           git commit -m 'gofakes3: support conditional object writes' -m 'Based on rclone/gofakes3 v0.0.9. Isolated prerequisite module for serve s3 conditional writes; the rclone feature branch does not vendor this source.'
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/deps/serve-s3-conditional-writes
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push --force origin HEAD:refs/heads/deps/serve-s3-conditional-writes
           git rev-parse HEAD | tee /tmp/cas-results/protocol-revision.txt
-          printf 'v0.0.0-%s-%s\n' "$(git show -s --format=%cd --date=format-local:%Y%m%d%H%M%S HEAD)" "$(git rev-parse --short=12 HEAD)" | tee /tmp/cas-results/protocol-version.txt
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: protocol-results
+          path: /tmp/cas-results/*.txt
+          retention-days: 14
+
+  rclone:
+    if: github.repository == 'Spaceghost/rclone'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RCLONE_CONFIG: /notfound
+    steps:
+      - name: Checkout reviewed patches
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: patches
+          persist-credentials: false
+      - name: Checkout upstream rclone
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: rclone/rclone
+          ref: 73119d368f26d62059c0158ee25f0208e12d142a
+          path: work
+          persist-credentials: false
+      - name: Checkout protocol library
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: rclone/gofakes3
+          ref: v0.0.9
+          path: protocol
+          persist-credentials: false
+      - name: Apply protocol patch
+        working-directory: protocol
+        run: |
+          git apply ../patches/gofakes3-conditional-writes.patch
+          git apply ../patches/gofakes3-conditional-fixes.patch
+      - name: Apply rclone patches
+        working-directory: work
+        run: |
+          set -euo pipefail
+          git apply --check ../patches/rclone-existing-files.patch
+          git apply ../patches/rclone-existing-files.patch
+          cp -a ../patches/rclone-files/. .
+          git apply --check ../patches/rclone-xfs-atomic-commit.patch
+          git apply ../patches/rclone-xfs-atomic-commit.patch
+          git diff --check
+          test -z "$(gofmt -l cmd/serve/s3 backend/local fs/atomic_commit.go)"
+          go mod edit -replace github.com/rclone/gofakes3=../protocol
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: work/go.sum
+      - name: Test conditional writes and local backend
+        working-directory: work
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/cas-results
+          go test -race -count=1 -skip '^TestS3Minio$' ./cmd/serve/s3 ./backend/local ./fs 2>&1 | tee /tmp/cas-results/rclone-race.txt
+          go build ./... 2>&1 | tee /tmp/cas-results/rclone-build.txt
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rclone-results
           path: /tmp/cas-results/*.txt
           retention-days: 14
