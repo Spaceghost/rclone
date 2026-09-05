@@ -8,9 +8,12 @@ on:
       - .github/workflows/serve-s3-conditional-writes.yml
       - gofakes3-conditional-writes.patch
       - gofakes3-conditional-fixes.patch
+      - gofakes3-conditional-aws-semantics.patch
       - rclone-existing-files.patch
       - rclone-cas-compile-fix.patch
       - rclone-xfs-atomic-commit.patch
+      - rclone-cas-atomic-fixes.patch
+      - rclone-xfs-integration-test.patch
       - rclone-files/**
   workflow_dispatch:
 
@@ -40,11 +43,16 @@ jobs:
       - name: Apply protocol change
         working-directory: protocol
         run: |
+          set -euo pipefail
           git apply --check ../patches/gofakes3-conditional-writes.patch
           git apply ../patches/gofakes3-conditional-writes.patch
+          git apply --check ../patches/gofakes3-conditional-fixes.patch
           git apply ../patches/gofakes3-conditional-fixes.patch
+          git apply --check ../patches/gofakes3-conditional-aws-semantics.patch
+          git apply ../patches/gofakes3-conditional-aws-semantics.patch
           git diff --check
           test -z "$(gofmt -l conditional.go conditional_test.go error.go gofakes3.go)"
+          ! git diff --unified=0 | grep '^+' | grep -E 'TODO|FIXME'
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
@@ -89,7 +97,7 @@ jobs:
   rclone:
     if: github.repository == 'Spaceghost/rclone'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       RCLONE_CONFIG: /notfound
     steps:
@@ -115,8 +123,10 @@ jobs:
       - name: Apply protocol patch
         working-directory: protocol
         run: |
+          set -euo pipefail
           git apply ../patches/gofakes3-conditional-writes.patch
           git apply ../patches/gofakes3-conditional-fixes.patch
+          git apply ../patches/gofakes3-conditional-aws-semantics.patch
       - name: Apply rclone patches
         working-directory: work
         run: |
@@ -128,8 +138,13 @@ jobs:
           git apply ../patches/rclone-cas-compile-fix.patch
           git apply --check ../patches/rclone-xfs-atomic-commit.patch
           git apply ../patches/rclone-xfs-atomic-commit.patch
+          git apply --check ../patches/rclone-cas-atomic-fixes.patch
+          git apply ../patches/rclone-cas-atomic-fixes.patch
+          git apply --check ../patches/rclone-xfs-integration-test.patch
+          git apply ../patches/rclone-xfs-integration-test.patch
           git diff --check
           test -z "$(gofmt -l cmd/serve/s3 backend/local fs/atomic_commit.go)"
+          ! git diff --unified=0 | grep '^+' | grep -E 'TODO|FIXME'
           go mod edit -replace github.com/rclone/gofakes3=../protocol
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -143,6 +158,26 @@ jobs:
           mkdir -p /tmp/cas-results
           go test -race -count=1 -skip '^TestS3Minio$' ./cmd/serve/s3 ./backend/local ./fs 2>&1 | tee /tmp/cas-results/rclone-race.txt
           go build ./... 2>&1 | tee /tmp/cas-results/rclone-build.txt
+      - name: Mount XFS test filesystem
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+          truncate -s 512M /tmp/rclone-xfs.img
+          sudo mkfs.xfs -f /tmp/rclone-xfs.img
+          sudo mkdir -p /mnt/rclone-xfs
+          sudo mount -o loop /tmp/rclone-xfs.img /mnt/rclone-xfs
+          sudo chown "$USER" /mnt/rclone-xfs
+          findmnt -no FSTYPE /mnt/rclone-xfs | grep -x xfs
+      - name: Exercise XFS commit ioctls
+        working-directory: work
+        env:
+          RCLONE_TEST_XFS_DIR: /mnt/rclone-xfs
+        run: |
+          set -o pipefail
+          go test -v -count=1 -run '^TestXFSAtomicCommit$' ./backend/local 2>&1 | tee /tmp/cas-results/xfs-integration.txt
+      - name: Unmount XFS test filesystem
+        if: always()
+        run: sudo umount /mnt/rclone-xfs || true
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
