@@ -1,8 +1,7 @@
 diff --git a/conditional.go b/conditional.go
-index 7a7c37a..8ab1fb8 100644
 --- a/conditional.go
 +++ b/conditional.go
-@@ -31,7 +31,7 @@ func (c *WriteConditions) Check(exists bool, etag string) error {
+@@ -33,7 +33,7 @@ func (c *WriteConditions) Check(exists bool, etag string) error {
  	}
  	if c.IfMatch != "" {
  		if !exists {
@@ -11,11 +10,7 @@ index 7a7c37a..8ab1fb8 100644
  		}
  		if c.IfMatch != "*" {
  			if etag == "" {
-@@ -46,16 +46,16 @@ func (c *WriteConditions) Check(exists bool, etag string) error {
- 	return nil
- }
- 
- func parseWriteConditions(h http.Header) (*WriteConditions, error) {
+@@ -52,8 +52,8 @@ func parseWriteConditions(h http.Header) (*WriteConditions, error) {
  	var c WriteConditions
  	for name, dst := range map[string]*string{"If-Match": &c.IfMatch, "If-None-Match": &c.IfNoneMatch} {
 -		values, present := h[name]
@@ -25,10 +20,7 @@ index 7a7c37a..8ab1fb8 100644
  			continue
  		}
  		if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
- 			return nil, ErrorInvalidArgument(name, strings.Join(values, ","), "Expected a single write condition")
- 		}
- 		*dst = strings.TrimSpace(values[0])
- 	}
+@@ -65,6 +65,9 @@ func parseWriteConditions(h http.Header) (*WriteConditions, error) {
  	if c.IfMatch == "" && c.IfNoneMatch == "" {
  		return nil, nil
  	}
@@ -38,19 +30,10 @@ index 7a7c37a..8ab1fb8 100644
  	if c.IfNoneMatch != "" && c.IfNoneMatch != "*" {
  		return nil, ErrorInvalidArgument("If-None-Match", c.IfNoneMatch, "Expected *")
  	}
-@@ -75,7 +75,7 @@ func parseWriteConditions(h http.Header) (*WriteConditions, error) {
- 		if etag == "" || etag == "*" || strings.ContainsAny(etag, "\" ,\t\r\n") || strings.HasPrefix(etag, "W/") {
- 			return nil, ErrorInvalidArgument("If-Match", c.IfMatch, "Expected a single strong ETag")
- 		}
- 		c.IfMatch = etag
- 	}
- 	return &c, nil
- }
 diff --git a/conditional_test.go b/conditional_test.go
-index 21cb838..d6eec7b 100644
 --- a/conditional_test.go
 +++ b/conditional_test.go
-@@ -29,7 +29,7 @@ func TestWriteConditions(t *testing.T) {
+@@ -31,11 +31,11 @@ func TestWriteConditions(t *testing.T) {
  		{"Exists", "", "*", "old", true, ErrPreconditionFailed},
  		{"Match", "old", "", "old", true, nil},
  		{"Stale", "old", "", "new", true, ErrPreconditionFailed},
@@ -63,7 +46,7 @@ index 21cb838..d6eec7b 100644
  		{"InvalidNone", "", "etag", "etag", true, ErrInvalidArgument},
  		{"Both", "old", "*", "old", true, ErrPreconditionFailed},
  		{"CaseSensitive", "OLD", "", "old", true, ErrPreconditionFailed},
-@@ -58,6 +58,7 @@ func TestParseWriteConditions(t *testing.T) {
+@@ -60,6 +60,7 @@ func TestParseWriteConditions(t *testing.T) {
  		{"NoneTag", http.Header{"If-None-Match": {`"etag"`}}, nil, true},
  		{"NoneEmpty", http.Header{"If-None-Match": {""}}, nil, true},
  		{"NoneDuplicate", http.Header{"If-None-Match": {"*", "*"}}, nil, true},
@@ -71,7 +54,7 @@ index 21cb838..d6eec7b 100644
  	} {
  		t.Run(tc.name, func(t *testing.T) {
  			got, err := parseWriteConditions(tc.h)
-@@ -78,6 +79,14 @@ func TestPreconditionFailedResponse(t *testing.T) {
+@@ -80,6 +81,14 @@ func TestPreconditionFailedResponse(t *testing.T) {
  	assert.Contains(t, r.Body.String(), "<Code>PreconditionFailed</Code>")
  }
  
@@ -87,10 +70,9 @@ index 21cb838..d6eec7b 100644
  	g := New(nil)
  	_, err := g.putObjectWithConditions(context.Background(), "bucket", "key", nil, nil, 0, &WriteConditions{IfNoneMatch: "*"})
 diff --git a/error.go b/error.go
-index 75b2732..3135ffd 100644
 --- a/error.go
 +++ b/error.go
-@@ -90,6 +90,9 @@ const (
+@@ -92,6 +92,9 @@ const (
  	ErrTooManyBuckets       ErrorCode = "TooManyBuckets"
  	ErrNotImplemented       ErrorCode = "NotImplemented"
  
@@ -100,8 +82,7 @@ index 75b2732..3135ffd 100644
  	// The destination did not satisfy a conditional write.
  	ErrPreconditionFailed ErrorCode = "PreconditionFailed"
  
-@@ -234,6 +237,9 @@ func (e ErrorCode) Message() string {
- 
+@@ -236,6 +239,9 @@ func (e ErrorCode) Status() int {
  func (e ErrorCode) Status() int {
  	switch e {
 +	case ErrConditionalRequestConflict:
