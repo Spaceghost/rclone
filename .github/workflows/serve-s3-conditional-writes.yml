@@ -4,30 +4,79 @@ on:
   push:
     branches:
       - ci/serve-s3-conditional-writes
+    paths:
+      - .github/workflows/serve-s3-conditional-writes.yml
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  source:
+  protocol:
     if: github.repository == 'Spaceghost/rclone'
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
+      - name: Checkout reviewed patches
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: patches
+          persist-credentials: false
       - name: Checkout S3 protocol library
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: rclone/gofakes3
           ref: v0.0.9
+          path: protocol
           persist-credentials: false
-      - name: Archive source
+      - name: Apply protocol change
+        working-directory: protocol
         run: |
-          git archive --format=tar.gz -o /tmp/gofakes3.tar.gz HEAD
-          git rev-parse HEAD
-      - name: Upload source
+          git apply --check ../patches/gofakes3-conditional-writes.patch
+          git apply ../patches/gofakes3-conditional-writes.patch
+          git apply ../patches/gofakes3-conditional-fixes.patch
+          git diff --check
+          test -z "$(gofmt -l conditional.go conditional_test.go error.go gofakes3.go)"
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: protocol/go.sum
+      - name: Test protocol library
+        working-directory: protocol
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/cas-results
+          go test -race -count=1 ./... 2>&1 | tee /tmp/cas-results/protocol-race.txt
+      - name: Checkout upstream base for prerequisite branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 73119d368f26d62059c0158ee25f0208e12d142a
+          path: publish
+          persist-credentials: false
+      - name: Publish isolated prerequisite module
+        working-directory: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git checkout -b deps/serve-s3-conditional-writes
+          mkdir gofakes3
+          tar -C ../protocol --exclude=./.git -cf - . | tar -C gofakes3 -xf -
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add gofakes3
+          git commit -m 'gofakes3: support conditional object writes' -m 'Based on rclone/gofakes3 v0.0.9. Isolated prerequisite module for serve s3 conditional writes; the rclone feature branch does not vendor this source.'
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/deps/serve-s3-conditional-writes
+          git rev-parse HEAD | tee /tmp/cas-results/protocol-revision.txt
+          printf 'v0.0.0-%s-%s\n' "$(git show -s --format=%cd --date=format-local:%Y%m%d%H%M%S HEAD)" "$(git rev-parse --short=12 HEAD)" | tee /tmp/cas-results/protocol-version.txt
+      - name: Upload results
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: gofakes3-source
-          path: /tmp/gofakes3.tar.gz
-          retention-days: 7
+          name: protocol-results
+          path: /tmp/cas-results/*.txt
+          retention-days: 14
