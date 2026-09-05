@@ -39,7 +39,31 @@ index 337cff5..52f1e79 100644
  	objectDir := path.Dir(fp)
  	// _, err = db.fs.Stat(objectDir)
  	// if err == vfs.ENOENT {
-@@ -486,14 +502,18 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
+@@ -420,7 +436,15 @@ func (b *s3Backend) PutObject(
+ 
+ 	// Rename the temporary object into place
+ 	if tmpFp != fp {
+-		if err := _vfs.Rename(tmpFp, fp); err != nil {
++		if conditions != nil {
++			if used, err := tryXFSCommit(_vfs, tmpFp, fp, n); err != nil {
++				cleanup()
++				return result, err
++			} else if used {
++				b.forgetPath(_vfs, tmpFp)
++				tmpFp = fp
++			}
++		}
++		if tmpFp != fp {
++			if err := _vfs.Rename(tmpFp, fp); err != nil {
++				cleanup()
++				return result, err
++			}
++		}
+-			cleanup()
+-			return result, err
+-		}
+ 	}
+@@ -486,14 +510,18 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
  	if err != nil {
  		return err
  	}
@@ -60,7 +84,7 @@ index 337cff5..52f1e79 100644
  	return nil
  }
  
-@@ -552,6 +572,11 @@ func (b *s3Backend) BucketExists(ctx context.Context, name string) (exists bool,
+@@ -552,6 +580,11 @@ func (b *s3Backend) BucketExists(ctx context.Context, name string) (exists bool,
  
  // CopyObject copy specified object from srcKey to dstKey.
  func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, meta map[string]string) (result gofakes3.CopyObjectResult, err error) {
@@ -72,7 +96,7 @@ index 337cff5..52f1e79 100644
  	_vfs, err := b.s.getVFS(ctx)
  	if err != nil {
  		return result, err
-@@ -561,6 +586,14 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
+@@ -561,6 +594,14 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
  		return result, err
  	}
  	if srcBucket == dstBucket && srcKey == dstKey {
@@ -87,7 +111,7 @@ index 337cff5..52f1e79 100644
  		b.meta.Store(fp, meta)
  
  		val, ok := meta["X-Amz-Meta-Mtime"]
-@@ -605,7 +638,7 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
+@@ -605,7 +646,7 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
  	// whose source is being overwritten as it is read - its stated size no
  	// longer matching its readable bytes - fails with IncompleteBody rather
  	// than storing a mixture.
@@ -132,10 +156,10 @@ index 11155ab..224797a 100644
  		b.multipartUploads.Delete(uploadID)
  		_ = up.abort()
 diff --git a/cmd/serve/s3/serve_s3.md b/cmd/serve/s3/serve_s3.md
-index 495efb8..8f13652 100644
+index 495efb8..095ab9d 100644
 --- a/cmd/serve/s3/serve_s3.md
 +++ b/cmd/serve/s3/serve_s3.md
-@@ -112,6 +112,42 @@ written directly and a failed PUT may leave a partial object at the key). If
+@@ -112,6 +112,49 @@ written directly and a failed PUT may leave a partial object at the key). If
  with a leading `.rclone_temp_put_`) may be left behind; it is hidden from
  S3 listings but must be removed manually.
  
@@ -162,6 +186,14 @@ index 495efb8..8f13652 100644
 +or changes made directly to the backing remote. All writers participating
 +in compare-and-swap must use the same server and VFS, and distinct keys
 +must not alias one backing object.
++
++On Linux with a local XFS backend and VFS caching below `minimal`, conditional
++plain PUT commits use `XFS_IOC_START_COMMIT` and `XFS_IOC_COMMIT_RANGE` when
++the running kernel supports them. XFS rechecks destination freshness at the
++atomic range exchange, so a destination changed outside this server causes
++the commit to fail instead of silently overwriting the newer contents. Other
++filesystems, older kernels and cached VFS writes use the normal serialized
++rename path.
 +
 +Conditional writes require a backend with server-side move or copy, so that
 +multipart uploads can be staged without changing the destination before
@@ -215,4 +247,4 @@ index 0d778dc..0d013d1 100644
 +	b.rmdirRecursive(ctx, dir, VFS)
  }
  
- func authlistResolver(list []string) (map[string]string, error) {
+ func authlistResolver(list []string, error) {
