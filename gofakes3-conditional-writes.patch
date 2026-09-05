@@ -1,0 +1,290 @@
+diff --git a/conditional.go b/conditional.go
+new file mode 100644
+index 0000000..4f2a000
+--- /dev/null
++++ b/conditional.go
+@@ -0,0 +1,106 @@
++package gofakes3
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"strings"
++)
++
++// WriteConditions are preconditions on the destination of a write.
++// A zero value imposes no conditions. IfMatch is a single ETag, without
++// quotes, or "*". IfNoneMatch is either empty or "*".
++type WriteConditions struct {
++	IfMatch     string
++	IfNoneMatch string
++}
++
++// Check returns an S3 error if the destination does not satisfy the conditions.
++// The backend must exclude competing mutations until the write is committed.
++// An unavailable ETag must not be passed as an empty string for an existing
++// object when IfMatch specifies an ETag.
++func (c *WriteConditions) Check(exists bool, etag string) error {
++	if c == nil {
++		return nil
++	}
++	if c.IfNoneMatch != "" && c.IfNoneMatch != "*" {
++		return ErrInvalidArgument
++	}
++	if c.IfNoneMatch == "*" && exists {
++		return ErrPreconditionFailed
++	}
++	if c.IfMatch != "" {
++		if !exists {
++			return ErrNoSuchKey
++		}
++		if c.IfMatch != "*" {
++			if etag == "" {
++				return ErrNotImplemented
++			}
++			if c.IfMatch != etag {
++				return ErrPreconditionFailed
++			}
++		}
++	}
++	return nil
++}
++
++func parseWriteConditions(h http.Header) (*WriteConditions, error) {
++	var c WriteConditions
++	for name, dst := range map[string]*string{"If-Match": &c.IfMatch, "If-None-Match": &c.IfNoneMatch} {
++		values, present := h[name]
++		if !present {
++			continue
++		}
++		if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
++			return nil, ErrorInvalidArgument(name, strings.Join(values, ","), "Expected a single write condition")
++		}
++		*dst = strings.TrimSpace(values[0])
++	}
++	if c.IfMatch == "" && c.IfNoneMatch == "" {
++		return nil, nil
++	}
++	if c.IfNoneMatch != "" && c.IfNoneMatch != "*" {
++		return nil, ErrorInvalidArgument("If-None-Match", c.IfNoneMatch, "Expected *")
++	}
++	if c.IfMatch != "" && c.IfMatch != "*" {
++		etag := c.IfMatch
++		if strings.HasPrefix(etag, `"`) && strings.HasSuffix(etag, `"`) && len(etag) >= 2 {
++			etag = etag[1 : len(etag)-1]
++		}
++		if etag == "" || strings.ContainsAny(etag, "\" ,\t\r\n") || strings.HasPrefix(etag, "W/") {
++			return nil, ErrorInvalidArgument("If-Match", c.IfMatch, "Expected a single strong ETag")
++		}
++		c.IfMatch = etag
++	}
++	return &c, nil
++}
++
++// ConditionalPutObjectBackend supports atomic conditional object uploads.
++// Backends must serialize the condition check and write with all mutations
++// of the destination, including unconditional writes and deletes.
++type ConditionalPutObjectBackend interface {
++	PutObjectWithConditions(ctx context.Context, bucketName, objectName string, meta map[string]string, input io.Reader, size int64, conditions *WriteConditions) (PutObjectResult, error)
++}
++
++// ConditionalCopyObjectBackend supports atomic conditional object copies.
++// Conditions apply to the destination, not the source.
++type ConditionalCopyObjectBackend interface {
++	CopyObjectWithConditions(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, meta map[string]string, conditions *WriteConditions) (CopyObjectResult, error)
++}
++
++// ConditionalMultipartBackend supports atomic conditional multipart completion.
++// Conditions apply at completion, not when the upload is initiated.
++type ConditionalMultipartBackend interface {
++	CompleteMultipartUploadWithConditions(ctx context.Context, bucketName, objectName string, uploadID UploadID, input *CompleteMultipartUploadRequest, conditions *WriteConditions) (VersionID, string, error)
++}
++
++func (g *GoFakeS3) putObjectWithConditions(ctx context.Context, bucket, key string, meta map[string]string, input io.Reader, size int64, conditions *WriteConditions) (PutObjectResult, error) {
++	if conditions == nil {
++		return g.storage.PutObject(ctx, bucket, key, meta, input, size)
++	}
++	if b, ok := g.storage.(ConditionalPutObjectBackend); ok {
++		return b.PutObjectWithConditions(ctx, bucket, key, meta, input, size, conditions)
++	}
++	return PutObjectResult{}, ErrNotImplemented
++}
+diff --git a/conditional_test.go b/conditional_test.go
+new file mode 100644
+index 0000000..2605729
+--- /dev/null
++++ b/conditional_test.go
+@@ -0,0 +1,80 @@
++package gofakes3
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestWriteConditions(t *testing.T) {
++	for _, tc := range []struct {
++		name, match, none, etag string
++		exists                  bool
++		want                    error
++	}{
++		{"Unconditional", "", "", "", false, nil},
++		{"Create", "", "*", "", false, nil},
++		{"Exists", "", "*", "old", true, ErrPreconditionFailed},
++		{"Match", "old", "", "old", true, nil},
++		{"Stale", "old", "", "new", true, ErrPreconditionFailed},
++		{"Missing", "old", "", "", false, ErrNoSuchKey},
++		{"NoHash", "old", "", "", true, ErrNotImplemented},
++		{"AnyExisting", "*", "", "", true, nil},
++		{"AnyMissing", "*", "", "", false, ErrNoSuchKey},
++		{"InvalidNone", "", "etag", "etag", true, ErrInvalidArgument},
++		{"Both", "old", "*", "old", true, ErrPreconditionFailed},
++		{"CaseSensitive", "OLD", "", "old", true, ErrPreconditionFailed},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			c := &WriteConditions{IfMatch: tc.match, IfNoneMatch: tc.none}
++			assert.ErrorIs(t, c.Check(tc.exists, tc.etag), tc.want)
++		})
++	}
++	var c *WriteConditions
++	assert.NoError(t, c.Check(false, ""))
++}
++
++func TestParseWriteConditions(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		h       http.Header
++		want    *WriteConditions
++		invalid bool
++	}{
++		{"Absent", nil, nil, false},
++		{"Create", http.Header{"If-None-Match": {"*"}}, &WriteConditions{IfNoneMatch: "*"}, false},
++		{"Quoted", http.Header{"If-Match": {`"etag"`}}, &WriteConditions{IfMatch: "etag"}, false},
++		{"Bare", http.Header{"If-Match": {"etag"}}, &WriteConditions{IfMatch: "etag"}, false},
++		{"Spaces", http.Header{"If-Match": {" \t\"etag\" \t"}}, &WriteConditions{IfMatch: "etag"}, false},
++		{"Wildcard", http.Header{"If-Match": {"*"}}, &WriteConditions{IfMatch: "*"}, false},
++		{"Empty", http.Header{"If-Match": {""}}, nil, true},
++		{"EmptyQuoted", http.Header{"If-Match": {`""`}}, nil, true},
++		{"Weak", http.Header{"If-Match": {`W/"etag"`}}, nil, true},
++		{"List", http.Header{"If-Match": {`"a", "b"`}}, nil, true},
++		{"Duplicate", http.Header{"If-Match": {"a", "b"}}, nil, true},
++		{"NoneTag", http.Header{"If-None-Match": {`"etag"`}}, nil, true},
++		{"NoneEmpty", http.Header{"If-None-Match": {""}}, nil, true},
++		{"NoneDuplicate", http.Header{"If-None-Match": {"*", "*"}}, nil, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := parseWriteConditions(tc.h)
++			if tc.invalid {
++				require.True(t, HasErrorCode(err, ErrInvalidArgument))
++			} else {
++				require.NoError(t, err)
++				assert.Equal(t, tc.want, got)
++			}
++		})
++	}
++}
++
++func TestPreconditionFailedResponse(t *testing.T) {
++	g := New(nil)
++	r := httptest.NewRecorder()
++	g.httpError(r, httptest.NewRequest(http.MethodPut, "/bucket/key", nil), ErrPreconditionFailed)
++	assert.Equal(t, http.StatusPreconditionFailed, r.Code)
++	assert.Contains(t, r.Body.String(), "<Code>PreconditionFailed</Code>")
++}
+diff --git a/error.go b/error.go
+index 87669ac..75b2732 100644
+--- a/error.go
++++ b/error.go
+@@ -90,6 +90,9 @@ const (
+ 	ErrTooManyBuckets       ErrorCode = "TooManyBuckets"
+ 	ErrNotImplemented       ErrorCode = "NotImplemented"
+ 
++	// The destination did not satisfy a conditional write.
++	ErrPreconditionFailed ErrorCode = "PreconditionFailed"
++
+ 	ErrInternal ErrorCode = "InternalError"
+ )
+ 
+@@ -231,6 +234,9 @@ func (e ErrorCode) Message() string {
+ 
+ func (e ErrorCode) Status() int {
+ 	switch e {
++	case ErrPreconditionFailed:
++		return http.StatusPreconditionFailed
++
+ 	case ErrBucketAlreadyExists,
+ 		ErrBucketNotEmpty:
+ 		return http.StatusConflict
+diff --git a/gofakes3.go b/gofakes3.go
+index 791b273..b080bc8 100644
+--- a/gofakes3.go
++++ b/gofakes3.go
+@@ -759,7 +759,11 @@ func (g *GoFakeS3) createObject(bucket, object string, w http.ResponseWriter, r
+ 		return err
+ 	}
+ 
+-	result, err := g.storage.PutObject(r.Context(), bucket, object, meta, rdr, size)
++	conditions, err := parseWriteConditions(r.Header)
++	if err != nil {
++		return err
++	}
++	result, err := g.putObjectWithConditions(r.Context(), bucket, object, meta, rdr, size, conditions)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -819,7 +823,18 @@ func (g *GoFakeS3) copyObject(bucket, object string, meta map[string]string, w h
+ 	// }
+ 	delete(meta, "X-Amz-Acl")
+ 
+-	result, err := g.storage.CopyObject(ctx, srcBucket, srcKey, bucket, object, meta)
++	conditions, err := parseWriteConditions(r.Header)
++	if err != nil {
++		return err
++	}
++	var result CopyObjectResult
++	if conditions == nil {
++		result, err = g.storage.CopyObject(ctx, srcBucket, srcKey, bucket, object, meta)
++	} else if b, ok := g.storage.(ConditionalCopyObjectBackend); ok {
++		result, err = b.CopyObjectWithConditions(ctx, srcBucket, srcKey, bucket, object, meta, conditions)
++	} else {
++		return ErrNotImplemented
++	}
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -1120,8 +1135,20 @@ func (g *GoFakeS3) completeMultipartUpload(bucket, object string, uploadID Uploa
+ 		return err
+ 	}
+ 
++	conditions, err := parseWriteConditions(r.Header)
++	if err != nil {
++		return err
++	}
+ 	if upload.streaming {
+-		versionID, etag, err := g.multipart.CompleteMultipartUpload(r.Context(), bucket, object, uploadID, &in)
++		var versionID VersionID
++		var etag string
++		if conditions == nil {
++			versionID, etag, err = g.multipart.CompleteMultipartUpload(r.Context(), bucket, object, uploadID, &in)
++		} else if b, ok := g.multipart.(ConditionalMultipartBackend); ok {
++			versionID, etag, err = b.CompleteMultipartUploadWithConditions(r.Context(), bucket, object, uploadID, &in, conditions)
++		} else {
++			return ErrNotImplemented
++		}
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -1145,7 +1172,7 @@ func (g *GoFakeS3) completeMultipartUpload(bucket, object string, uploadID Uploa
+ 		return err
+ 	}
+ 
+-	result, err := g.storage.PutObject(r.Context(), bucket, object, upload.Meta, bytes.NewReader(fileBody), int64(len(fileBody)))
++	result, err := g.putObjectWithConditions(r.Context(), bucket, object, upload.Meta, bytes.NewReader(fileBody), int64(len(fileBody)), conditions)
+ 	if err != nil {
+ 		return err
+ 	}
