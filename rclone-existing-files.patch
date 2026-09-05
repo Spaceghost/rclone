@@ -1,0 +1,218 @@
+diff --git a/cmd/serve/s3/backend.go b/cmd/serve/s3/backend.go
+index 337cff5..52f1e79 100644
+--- a/cmd/serve/s3/backend.go
++++ b/cmd/serve/s3/backend.go
+@@ -41,6 +41,9 @@ type s3Backend struct {
+ 	s    *Server
+ 	meta *sync.Map
+ 
++	objectLocksMu sync.Mutex
++	objectLocks   map[objectLockKey]*objectLock
++
+ 	// multipartUploads tracks in-flight streaming multipart uploads,
+ 	// keyed by gofakes3.UploadID.
+ 	multipartUploads sync.Map
+@@ -335,6 +338,11 @@ func (b *s3Backend) PutObject(
+ 	meta map[string]string,
+ 	input io.Reader, size int64,
+ ) (result gofakes3.PutObjectResult, err error) {
++	return b.PutObjectWithConditions(ctx, bucketName, objectName, meta, input, size, nil)
++}
++
++// PutObjectWithConditions uploads an object if the destination satisfies conditions.
++func (b *s3Backend) PutObjectWithConditions(ctx context.Context, bucketName, objectName string, meta map[string]string, input io.Reader, size int64, conditions *gofakes3.WriteConditions) (result gofakes3.PutObjectResult, err error) {
+ 	_vfs, err := b.s.getVFS(ctx)
+ 	if err != nil {
+ 		return result, err
+@@ -348,6 +356,14 @@ func (b *s3Backend) PutObject(
+ 	if err != nil {
+ 		return result, err
+ 	}
++	unlock, err := b.lockObject(ctx, _vfs, fp)
++	if err != nil {
++		return result, err
++	}
++	defer unlock()
++	if err := b.checkWriteConditions(_vfs, fp, conditions); err != nil {
++		return result, err
++	}
+ 	objectDir := path.Dir(fp)
+ 	// _, err = db.fs.Stat(objectDir)
+ 	// if err == vfs.ENOENT {
+@@ -486,14 +502,18 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
+ 	if err != nil {
+ 		return err
+ 	}
++	unlock, err := b.lockObject(ctx, _vfs, fp)
++	if err != nil {
++		return err
++	}
++	defer unlock()
+ 	// S3 does not report an error when attempting to delete a key that does not exist, so
+ 	// we need to skip IsNotExist errors.
+ 	if err := _vfs.Remove(fp); err != nil && !os.IsNotExist(err) {
+ 		return err
+ 	}
+ 
+-	// FIXME: unsafe operation
+-	rmdirRecursive(fp, _vfs)
++	b.rmdirRecursive(ctx, fp, _vfs)
+ 	return nil
+ }
+ 
+@@ -552,6 +572,11 @@ func (b *s3Backend) BucketExists(ctx context.Context, name string) (exists bool,
+ 
+ // CopyObject copy specified object from srcKey to dstKey.
+ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, meta map[string]string) (result gofakes3.CopyObjectResult, err error) {
++	return b.CopyObjectWithConditions(ctx, srcBucket, srcKey, dstBucket, dstKey, meta, nil)
++}
++
++// CopyObjectWithConditions copies an object if the destination satisfies conditions.
++func (b *s3Backend) CopyObjectWithConditions(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, meta map[string]string, conditions *gofakes3.WriteConditions) (result gofakes3.CopyObjectResult, err error) {
+ 	_vfs, err := b.s.getVFS(ctx)
+ 	if err != nil {
+ 		return result, err
+@@ -561,6 +586,14 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
+ 		return result, err
+ 	}
+ 	if srcBucket == dstBucket && srcKey == dstKey {
++		unlock, err := b.lockObject(ctx, _vfs, fp)
++		if err != nil {
++			return result, err
++		}
++		defer unlock()
++		if err := b.checkWriteConditions(_vfs, fp, conditions); err != nil {
++			return result, err
++		}
+ 		b.meta.Store(fp, meta)
+ 
+ 		val, ok := meta["X-Amz-Meta-Mtime"]
+@@ -605,7 +638,7 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
+ 	// whose source is being overwritten as it is read - its stated size no
+ 	// longer matching its readable bytes - fails with IncompleteBody rather
+ 	// than storing a mixture.
+-	_, err = b.PutObject(ctx, dstBucket, dstKey, meta, c.Contents, c.Size)
++	_, err = b.PutObjectWithConditions(ctx, dstBucket, dstKey, meta, c.Contents, c.Size, conditions)
+ 	if err != nil {
+ 		return
+ 	}
+ diff --git a/cmd/serve/s3/multipart.go b/cmd/serve/s3/multipart.go
+index 11155ab..224797a 100644
+--- a/cmd/serve/s3/multipart.go
++++ b/cmd/serve/s3/multipart.go
+@@ -379,6 +379,11 @@ func pipePart(w io.Writer, rw *pool.RW) error {
+ // S3-style multipart ETag, and stores the user metadata so HeadObject and
+ // GetObject see the same fields the in-memory PutObject path produces.
+ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, objectName string, uploadID gofakes3.UploadID, input *gofakes3.CompleteMultipartUploadRequest) (gofakes3.VersionID, string, error) {
++	return b.CompleteMultipartUploadWithConditions(ctx, bucketName, objectName, uploadID, input, nil)
++}
++
++// CompleteMultipartUploadWithConditions completes an upload if its destination satisfies conditions.
++func (b *s3Backend) CompleteMultipartUploadWithConditions(ctx context.Context, bucketName, objectName string, uploadID gofakes3.UploadID, input *gofakes3.CompleteMultipartUploadRequest, conditions *gofakes3.WriteConditions) (gofakes3.VersionID, string, error) {
+ 	up, err := b.loadUpload(uploadID)
+ 	if err != nil {
+ 		return "", "", err
+@@ -386,6 +391,18 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, obj
+ 	up.startActivity()
+ 	defer up.endActivity()
+ 
++	unlock, err := b.lockObject(ctx, up.vfs, up.fp)
++	if err != nil {
++		return "", "", err
++	}
++	defer unlock()
++	if _, err := b.loadUpload(uploadID); err != nil {
++		return "", "", err
++	}
++	if err := b.checkWriteConditions(up.vfs, up.fp, conditions); err != nil {
++		return "", "", err
++	}
++
+ 	if err := up.validate(input); err != nil {
+ 		b.multipartUploads.Delete(uploadID)
+ 		_ = up.abort()
+diff --git a/cmd/serve/s3/serve_s3.md b/cmd/serve/s3/serve_s3.md
+index 495efb8..8f13652 100644
+--- a/cmd/serve/s3/serve_s3.md
++++ b/cmd/serve/s3/serve_s3.md
+@@ -112,6 +112,42 @@ written directly and a failed PUT may leave a partial object at the key). If
+ with a leading `.rclone_temp_put_`) may be left behind; it is hidden from
+ S3 listings but must be removed manually.
+ 
++### Conditional writes
++
++`PutObject`, `CopyObject`, and `CompleteMultipartUpload` support conditional
++writes to the destination:
++
++- `If-None-Match: *` creates an object only if the key does not already exist.
++- `If-Match: "ETag"` replaces an object only if its current ETag matches.
++  Use the ETag returned by `HEAD` or `GET`. `If-Match: *` requires an existing
++  object without comparing its contents.
++
++A failed condition returns `412 PreconditionFailed`, except that `If-Match`
++on a missing object returns `404 NoSuchKey`. Only a single strong ETag is
++accepted; empty conditions, weak ETags and ETag lists return `400 InvalidArgument`.
++For multipart uploads the condition is checked at completion, not initiation.
++A rejected completion leaves the upload available to retry or abort.
++
++The check and write are serialized with other writes, copies, deletes and
++multipart completions for the same key through this server and VFS. Unrelated
++keys can still be written concurrently. This does not coordinate separate
++server instances, overlapping auth-proxy mappings, other rclone commands,
++or changes made directly to the backing remote. All writers participating
++in compare-and-swap must use the same server and VFS, and distinct keys
++must not alias one backing object.
++
++Conditional writes require a backend with server-side move or copy, so that
++multipart uploads can be staged without changing the destination before
++completion. Unsupported backends return `501 NotImplemented`; do not use
++conditional multipart uploads on them. Comparing an ETag also returns `501`
++if the configured hash is disabled or unavailable. Create-if-absent and
++`If-Match: *` do not need a hash.
++
++ETags identify contents, not a unique revision: restoring the same contents
++can restore the same ETag. Include a revision or nonce in the object when
++this distinction matters. Conditional writes do not change VFS write-back
++or the durability guarantees of the backing remote.
++
+ ### Multipart uploads
+ 
+ Multipart uploads are written, in part-number order, to a temporary
+diff --git a/cmd/serve/s3/utils.go b/cmd/serve/s3/utils.go
+index 0d778dc..0d013d1 100644
+--- a/cmd/serve/s3/utils.go
++++ b/cmd/serve/s3/utils.go
+@@ -155,19 +155,26 @@ func mkdirRecursive(path string, VFS *vfs.VFS) error {
+ 	return nil
+ }
+ 
+-func rmdirRecursive(p string, VFS *vfs.VFS) {
++// rmdirRecursive removes empty parents without deleting replacement objects.
++func (b *s3Backend) rmdirRecursive(ctx context.Context, p string, VFS *vfs.VFS) {
+ 	dir := path.Dir(p)
+ 	if !strings.ContainsAny(dir, "/\\") {
+ 		// might be bucket(root)
+ 		return
+ 	}
+-	if _, err := VFS.Stat(dir); err == nil {
+-		err := VFS.Remove(dir)
+-		if err != nil {
+-			return
+-		}
+-		rmdirRecursive(dir, VFS)
++	unlock, err := b.lockObject(ctx, VFS, dir)
++	if err != nil {
++		return
++	}
++	defer unlock()
++	node, err := VFS.Stat(dir)
++	if err != nil || !node.IsDir() {
++		return
++	}
++	if err := VFS.Remove(dir); err != nil {
++		return
+ 	}
++	b.rmdirRecursive(ctx, dir, VFS)
+ }
+ 
+ func authlistResolver(list []string) (map[string]string, error) {
