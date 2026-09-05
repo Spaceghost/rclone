@@ -48,8 +48,8 @@ jobs:
           git apply ../patches/gofakes3-conditional-writes.patch
           git apply --check ../patches/gofakes3-conditional-fixes.patch
           git apply ../patches/gofakes3-conditional-fixes.patch
-          git apply --check ../patches/gofakes3-conditional-aws-semantics.patch
-          git apply ../patches/gofakes3-conditional-aws-semantics.patch
+          git apply --recount --check ../patches/gofakes3-conditional-aws-semantics.patch
+          git apply --recount ../patches/gofakes3-conditional-aws-semantics.patch
           git diff --check
           test -z "$(gofmt -l conditional.go conditional_test.go error.go gofakes3.go)"
           ! git diff --unified=0 | grep '^+' | grep -E 'TODO|FIXME'
@@ -126,7 +126,7 @@ jobs:
           set -euo pipefail
           git apply ../patches/gofakes3-conditional-writes.patch
           git apply ../patches/gofakes3-conditional-fixes.patch
-          git apply ../patches/gofakes3-conditional-aws-semantics.patch
+          git apply --recount ../patches/gofakes3-conditional-aws-semantics.patch
       - name: Apply rclone patches
         working-directory: work
         run: |
@@ -134,14 +134,14 @@ jobs:
           git apply --check ../patches/rclone-existing-files.patch
           git apply ../patches/rclone-existing-files.patch
           cp -a ../patches/rclone-files/. .
-          git apply --check ../patches/rclone-cas-compile-fix.patch
-          git apply ../patches/rclone-cas-compile-fix.patch
-          git apply --check ../patches/rclone-xfs-atomic-commit.patch
-          git apply ../patches/rclone-xfs-atomic-commit.patch
-          git apply --check ../patches/rclone-cas-atomic-fixes.patch
-          git apply ../patches/rclone-cas-atomic-fixes.patch
-          git apply --check ../patches/rclone-xfs-integration-test.patch
-          git apply ../patches/rclone-xfs-integration-test.patch
+          git apply --recount --check ../patches/rclone-cas-compile-fix.patch
+          git apply --recount ../patches/rclone-cas-compile-fix.patch
+          git apply --recount --check ../patches/rclone-xfs-atomic-commit.patch
+          git apply --recount ../patches/rclone-xfs-atomic-commit.patch
+          git apply --recount --check ../patches/rclone-cas-atomic-fixes.patch
+          git apply --recount ../patches/rclone-cas-atomic-fixes.patch
+          git apply --recount --check ../patches/rclone-xfs-integration-test.patch
+          git apply --recount ../patches/rclone-xfs-integration-test.patch
           git diff --check
           test -z "$(gofmt -l cmd/serve/s3 backend/local fs/atomic_commit.go)"
           ! git diff --unified=0 | grep '^+' | grep -E 'TODO|FIXME'
