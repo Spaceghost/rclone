@@ -14,6 +14,7 @@ on:
       - rclone-xfs-atomic-commit.patch
       - rclone-cas-atomic-fixes.patch
       - rclone-xfs-integration-test.patch
+      - rclone-cas-doc-fixes.patch
       - rclone-files/**
   workflow_dispatch:
 
@@ -142,6 +143,8 @@ jobs:
           git apply --recount ../patches/rclone-cas-atomic-fixes.patch
           git apply --recount --check ../patches/rclone-xfs-integration-test.patch
           git apply --recount ../patches/rclone-xfs-integration-test.patch
+          git apply --recount --check ../patches/rclone-cas-doc-fixes.patch
+          git apply --recount ../patches/rclone-cas-doc-fixes.patch
           git diff --check
           test -z "$(gofmt -l cmd/serve/s3 backend/local fs/atomic_commit.go)"
           ! git diff --unified=0 | grep '^+' | grep -E 'TODO|FIXME'
