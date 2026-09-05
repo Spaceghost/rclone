@@ -1,0 +1,290 @@
+diff --git a/backend/local/atomic_commit_linux.go b/backend/local/atomic_commit_linux.go
+new file mode 100644
+index 0000000..989f4fe
+--- /dev/null
++++ b/backend/local/atomic_commit_linux.go
+@@ -0,0 +1,153 @@
++//go:build linux
++
++package local
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"unsafe"
++
++	"github.com/rclone/rclone/fs"
++	"golang.org/x/sys/unix"
++)
++
++const (
++	xfsSuperMagic = 0x58465342
++
++	xfsExchangeRangeToEOF = 1 << 0
++	xfsExchangeRangeDsync = 1 << 1
++
++	// _IOR('X', 130, struct xfs_commit_range)
++	xfsIOCStartCommit = 0x80505882
++	// _IOW('X', 131, struct xfs_commit_range)
++	xfsIOCCommitRange = 0x40505883
++)
++
++type xfsCommitRange struct {
++	File1Fd        int32
++	Pad            uint32
++	File1Offset    uint64
++	File2Offset    uint64
++	Length         uint64
++	Flags          uint64
++	File2Freshness [5]uint64
++}
++
++type xfsAtomicCommit struct {
++	dst  *os.File
++	args xfsCommitRange
++	f    *Fs
++}
++
++func xfsIoctl(fd uintptr, req uintptr, arg *xfsCommitRange) error {
++	_, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, req, uintptr(unsafe.Pointer(arg)))
++	if errno != 0 {
++		return errno
++	}
++	return nil
++}
++
++func isXFS(file *os.File) (bool, error) {
++	var stat unix.Statfs_t
++	if err := unix.Fstatfs(int(file.Fd()), &stat); err != nil {
++		return false, err
++	}
++	return uint64(stat.Type) == xfsSuperMagic, nil
++}
++
++// StartAtomicCommit prepares an XFS conditional range commit for remote.
++func (f *Fs) StartAtomicCommit(ctx context.Context, remote string) (fs.AtomicCommit, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++
++	dstObj, err := f.newObject(remote)
++	if err != nil {
++		return nil, err
++	}
++	dst, err := os.OpenFile(dstObj.path, os.O_RDWR, 0)
++	if os.IsNotExist(err) {
++		return nil, fs.ErrorCantAtomicCommit
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	closeOnError := func(err error) (fs.AtomicCommit, error) {
++		_ = dst.Close()
++		return nil, err
++	}
++
++	xfs, err := isXFS(dst)
++	if err != nil {
++		return closeOnError(err)
++	}
++	if !xfs {
++		return closeOnError(fs.ErrorCantAtomicCommit)
++	}
++
++	commit := &xfsAtomicCommit{dst: dst, f: f}
++	if err := xfsIoctl(dst.Fd(), xfsIOCStartCommit, &commit.args); err != nil {
++		if errors.Is(err, unix.ENOTTY) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EINVAL) {
++			return closeOnError(fs.ErrorCantAtomicCommit)
++		}
++		return closeOnError(fmt.Errorf("XFS_IOC_START_COMMIT: %w", err))
++	}
++	return commit, nil
++}
++
++// Commit atomically exchanges srcRemote with the prepared destination if the
++// destination has not changed since StartAtomicCommit.
++func (c *xfsAtomicCommit) Commit(ctx context.Context, srcRemote string) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if c.dst == nil {
++		return os.ErrClosed
++	}
++
++	srcObj, err := c.f.newObject(srcRemote)
++	if err != nil {
++		return err
++	}
++	src, err := os.OpenFile(srcObj.path, os.O_RDWR, 0)
++	if err != nil {
++		return err
++	}
++	defer func() {
++		_ = src.Close()
++	}()
++
++	xfs, statErr := isXFS(src)
++	if statErr != nil {
++		return statErr
++	}
++	if !xfs {
++		return fs.ErrorCantAtomicCommit
++	}
++
++	c.args.File1Fd = int32(src.Fd())
++	c.args.Flags = xfsExchangeRangeToEOF | xfsExchangeRangeDsync
++	if err := xfsIoctl(c.dst.Fd(), xfsIOCCommitRange, &c.args); err != nil {
++		if errors.Is(err, unix.EBUSY) {
++			return fs.ErrorAtomicCommitConflict
++		}
++		if errors.Is(err, unix.ENOTTY) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EXDEV) {
++			return fs.ErrorCantAtomicCommit
++		}
++		return fmt.Errorf("XFS_IOC_COMMIT_RANGE: %w", err)
++	}
++	return nil
++}
++
++// Close releases the destination descriptor held by the prepared commit.
++func (c *xfsAtomicCommit) Close() error {
++	if c.dst == nil {
++		return nil
++	}
++	err := c.dst.Close()
++	c.dst = nil
++	return err
++}
+diff --git a/backend/local/atomic_commit_linux_test.go b/backend/local/atomic_commit_linux_test.go
+new file mode 100644
+index 0000000..877a333
+--- /dev/null
++++ b/backend/local/atomic_commit_linux_test.go
+@@ -0,0 +1,14 @@
++//go:build linux
++
++package local
++
++import (
++	"testing"
++	"unsafe"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestXFSCommitRangeLayout(t *testing.T) {
++	assert.Equal(t, uintptr(80), unsafe.Sizeof(xfsCommitRange{}))
++}
+diff --git a/cmd/serve/s3/backend.go b/cmd/serve/s3/backend.go
+index 337cff5..370bc77 100644
+--- a/cmd/serve/s3/backend.go
++++ b/cmd/serve/s3/backend.go
+@@ -4,6 +4,7 @@ package s3
+ import (
+ 	"context"
+ 	"encoding/hex"
++	"errors"
+ 	"io"
+ 	"maps"
+ 	"os"
+@@ -371,6 +372,24 @@ func (b *s3Backend) PutObject(
+ 		tmpFp = path.Join(objectDir, putObjectPrefix+uuid.New().String())
+ 	}
+ 
++	var atomicCommit fs.AtomicCommit
++	if conditions != nil && tmpFp != fp && _vfs.Opt.CacheMode < vfscommon.CacheModeMinimal {
++		if committer, ok := fsys.(fs.AtomicCommitter); ok {
++			atomicCommit, err = committer.StartAtomicCommit(ctx, fp)
++			if err != nil && !errors.Is(err, fs.ErrorCantAtomicCommit) {
++				return result, err
++			}
++			if errors.Is(err, fs.ErrorCantAtomicCommit) {
++				atomicCommit = nil
++			}
++		}
++	}
++	if atomicCommit != nil {
++		defer func() {
++			_ = atomicCommit.Close()
++		}()
++	}
++
+ 	// cleanup discards a failed upload, removing the temporary object
+ 	// (never the object at fp) and any stale VFS state for fp.
+ 	cleanup := func() {
+@@ -410,11 +429,33 @@ func (b *s3Backend) PutObject(
+ 		return result, err
+ 	}
+ 
+-	// Rename the temporary object into place
++	// Rename the temporary object into place. On filesystems which support
++	// guarded atomic replacement, prefer that and fall back to the normal
++	// move if the destination changed while the upload was in progress.
+ 	if tmpFp != fp {
+-		if err := _vfs.Rename(tmpFp, fp); err != nil {
+-			cleanup()
+-			return result, err
++		committed := false
++		if atomicCommit != nil {
++			err = atomicCommit.Commit(ctx, tmpFp)
++			if err == nil {
++				committed = true
++				b.forgetPath(_vfs, fp)
++				b.forgetPath(_vfs, tmpFp)
++				if removeErr := _vfs.Remove(tmpFp); removeErr != nil && !os.IsNotExist(removeErr) {
++					return result, removeErr
++				}
++			} else if errors.Is(err, fs.ErrorAtomicCommitConflict) && conditions != nil {
++				cleanup()
++				return result, gofakes3.ErrPreconditionFailed
++			} else if !errors.Is(err, fs.ErrorAtomicCommitConflict) && !errors.Is(err, fs.ErrorCantAtomicCommit) {
++				cleanup()
++				return result, err
++			}
++		}
++		if !committed {
++			if err := _vfs.Rename(tmpFp, fp); err != nil {
++				cleanup()
++				return result, err
++			}
+ 		}
+ 	}
+ 
+diff --git a/fs/atomic_commit.go b/fs/atomic_commit.go
+new file mode 100644
+index 0000000..69aa429
+--- /dev/null
++++ b/fs/atomic_commit.go
+@@ -0,0 +1,30 @@
++package fs
++
++import (
++	"context"
++	"errors"
++)
++
++var (
++	// ErrorCantAtomicCommit is returned when atomic commit is unavailable.
++	ErrorCantAtomicCommit = errors.New("atomic commit not available")
++	// ErrorAtomicCommitConflict is returned when the destination changed after
++	// preparation.
++	ErrorAtomicCommitConflict = errors.New("atomic commit conflict")
++)
++
++// AtomicCommit represents a prepared conditional replacement.
++type AtomicCommit interface {
++	// Commit atomically replaces the prepared destination with srcRemote.
++	Commit(ctx context.Context, srcRemote string) error
++	// Close releases resources held by the prepared commit.
++	Close() error
++}
++
++// AtomicCommitter is an optional interface for filesystems which can prepare
++// an atomic replacement guarded against concurrent modification.
++type AtomicCommitter interface {
++	// StartAtomicCommit samples the current state of remote for a later commit.
++	// It returns ErrorCantAtomicCommit when the operation is not available.
++	StartAtomicCommit(ctx context.Context, remote string) (AtomicCommit, error)
++}
