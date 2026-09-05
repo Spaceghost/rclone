@@ -1,0 +1,78 @@
+diff --git a/backend/local/atomic_commit_linux_test.go b/backend/local/atomic_commit_linux_test.go
+index 877a333..759a13e 100644
+--- a/backend/local/atomic_commit_linux_test.go
++++ b/backend/local/atomic_commit_linux_test.go
+@@ -3,12 +3,74 @@
+ package local
+ 
+ import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
+ 	"testing"
+ 	"unsafe"
+ 
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/config/configmap"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ )
+ 
+ func TestXFSCommitRangeLayout(t *testing.T) {
+ 	assert.Equal(t, uintptr(80), unsafe.Sizeof(xfsCommitRange{}))
+ }
++
++func TestXFSAtomicCommit(t *testing.T) {
++	root := os.Getenv("RCLONE_TEST_XFS_DIR")
++	if root == "" {
++		t.Skip("RCLONE_TEST_XFS_DIR not set")
++	}
++	dir, err := os.MkdirTemp(root, "rclone-xfs-commit-")
++	require.NoError(t, err)
++	defer func() {
++		require.NoError(t, os.RemoveAll(dir))
++	}()
++
++	ctx := context.Background()
++	fsi, err := NewFs(ctx, "local", dir, configmap.Simple{})
++	require.NoError(t, err)
++	f := fsi.(*Fs)
++	write := func(name, value string) {
++		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(value), 0600))
++	}
++	read := func(name string) string {
++		data, err := os.ReadFile(filepath.Join(dir, name))
++		require.NoError(t, err)
++		return string(data)
++	}
++
++	write("dst", "old")
++	write("src", "new contents")
++	commit, err := f.StartAtomicCommit(ctx, "dst")
++	require.NoError(t, err)
++	require.NoError(t, commit.Commit(ctx, "src"))
++	require.NoError(t, commit.Close())
++	assert.Equal(t, "new contents", read("dst"))
++	assert.Equal(t, "old", read("src"))
++
++	write("dst", "old again")
++	write("src", "candidate")
++	commit, err = f.StartAtomicCommit(ctx, "dst")
++	require.NoError(t, err)
++	write("dst", "external writer")
++	err = commit.Commit(ctx, "src")
++	require.ErrorIs(t, err, fs.ErrorAtomicCommitConflict)
++	require.NoError(t, commit.Close())
++	assert.Equal(t, "external writer", read("dst"))
++	assert.Equal(t, "candidate", read("src"))
++
++	write("staged", "created")
++	require.NoError(t, f.AtomicCreate(ctx, "staged", "created"))
++	assert.Equal(t, "created", read("created"))
++	write("staged2", "must not replace")
++	err = f.AtomicCreate(ctx, "staged2", "created")
++	require.True(t, errors.Is(err, fs.ErrorAtomicCommitConflict))
++	assert.Equal(t, "created", read("created"))
++	assert.Equal(t, "must not replace", read("staged2"))
++}
