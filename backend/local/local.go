@@ -829,6 +829,15 @@ func (f *Fs) localPath(name string) (string, error) {
 	return localPath, nil
 }
 
+// LocalPath returns the native path for remote, rejecting lexical root escapes.
+// It returns fs.ErrorNotImplemented when symlink handling requires the backend.
+func (f *Fs) LocalPath(remote string) (string, error) {
+	if f.opt.TranslateSymlinks || f.opt.FollowSymlinks {
+		return "", fs.ErrorNotImplemented
+	}
+	return f.localPath(remote)
+}
+
 // Put the Object to the local filesystem
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	// Temporary Object under construction - info filled in by Update()
