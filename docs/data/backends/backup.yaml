@@ -1,0 +1,19 @@
+backend: backup
+name: Kopia snapshots
+tier: Experimental
+maintainers: Community
+features_score: 0
+integration_tests: Local fixtures
+data_integrity: Kopia authenticated content
+performance: Unbenchmarked
+adoption: Experimental
+docs: Partial
+security: Experimental
+virtual: true
+remote: ''
+features:
+  - CanHaveEmptyDirectories
+  - Command
+  - Shutdown
+hashes: []
+precision: 1
