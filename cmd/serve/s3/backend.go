@@ -412,7 +412,7 @@ func (b *s3Backend) PutObject(
 
 	// Rename the temporary object into place
 	if tmpFp != fp {
-		if err := _vfs.Rename(tmpFp, fp); err != nil {
+		if err := b.publishObject(ctx, _vfs, tmpFp, fp); err != nil {
 			cleanup()
 			return result, err
 		}

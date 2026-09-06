@@ -115,11 +115,10 @@ S3 listings but must be removed manually.
 ### Multipart uploads
 
 Multipart uploads are written, in part-number order, to a temporary
-object which is renamed into place, server-side, on completion, so the
-upload is atomic. The object at the key only ever changes on a
-successful completion. A failed or aborted upload never affects any
-object already stored under that name and a partly-uploaded object
-never becomes visible under it.
+object. On successful completion it is published at the destination key.
+An incomplete or aborted upload never changes the object at that key.
+Final publication is atomic when the remote supports it, as described
+below.
 
 With the default `--vfs-cache-mode off` `serve s3` **streams** each
 multipart upload, in part-number order, into a single streaming upload
@@ -139,28 +138,20 @@ temporary file in the VFS cache and uploaded by the VFS write-back -
 see [Multipart uploads and the VFS
 cache](#multipart-uploads-and-the-vfs-cache) below.
 
-The rename into place needs the remote to support a server-side move
-or copy, which nearly all do. It is a cheap rename on most remotes,
+Publication normally uses a server-side move or copy, which nearly all
+remotes support. It is a cheap rename on most remotes,
 but on object stores without a real rename (such as `s3` itself) the
 move is performed as a server-side copy and delete of the whole
 object, which can take time and API calls for large objects.
-Concurrent multipart uploads of the same key (which S3 permits) are
-safe. Each writes its own temporary object and the last to complete
+Unconditional concurrent multipart uploads of the same key are safe. Each writes its own temporary object and the last to complete
 wins.
 
-On the few remotes that support neither server side move nor copy, the
-parts are written straight to the destination object instead and never
-buffered in memory. This is at some cost in atomicity - the incomplete
-object is visible under its final name while the upload is in flight,
-as it also is for a plain object PUT on such remotes, and concurrent
-multipart uploads of the same key write to the same object and can
-interleave. A failed or aborted upload still leaves any pre-existing
-object untouched provided the remote uploads atomically and the VFS
-cache is off; on a remote where partial uploads are visible it may
-leave partial data at the key (like a plain PUT there), and with
-`--vfs-cache-mode writes` (or `full`) a write to the cache cannot be
-abandoned, so an aborted upload's partial data is written back to the
-remote as if it had completed.
+On remotes without server-side move or copy, completion reads the staged
+object and uploads it through the normal PUT path. This needs an extra
+transfer and temporary storage, but an incomplete or aborted upload never
+reaches the final key. A failure during that final PUT has the remote's
+normal PUT limitations: where partial uploads are visible, a failed
+completion may leave partial data at the key.
 
 **Features**
 
@@ -180,9 +171,9 @@ remote as if it had completed.
   above).
 - Multipart uploads go through the VFS like any other upload, so they
   show in rclone's transfer stats and obey `--bwlimit`.
-- Backend-agnostic - it only needs the remote to support a server-side
-  move or copy for the rename into place, which nearly all do; a remote
-  without streaming upload support spools to local disk as above.
+- Backend-agnostic - remotes without server-side move or copy need an
+  extra read and upload on completion. A remote without streaming upload
+  support spools to local disk as above.
 
 **Limitations**
 
@@ -225,12 +216,9 @@ plain object PUT. This needs no streaming upload support from the
 remote. The rename normally happens in the cache before the upload has
 started, but the VFS requires the remote to support a server-side move
 or copy to rename files at all (and uses one if the temporary file has
-already been written back, e.g. with `--vfs-write-back 0`). On remotes
-without either, the parts are written to the cache directly under the
-final key instead: the upload still never touches memory, but it loses
-its atomicity - the in-flight upload is visible at the key, and an
-aborted upload cannot be abandoned once in the cache, so its partial
-data is written back to the remote as if it were a completed object.
+already been written back, e.g. with `--vfs-write-back 0`). Without either, completion reads the staged cache file through the
+normal PUT path, then removes it. Parts remain under the temporary name;
+abort discards them without changing the destination.
 
 Remotes that benefit from `--vfs-cache-mode writes`:
 
@@ -391,3 +379,24 @@ This matches the behaviour of other S3 servers such as MinIO.
   - `UploadPart`
 
 Other operations will return error `Unimplemented`.
+
+### Conditional writes
+
+PUT, COPY and multipart completion accept `If-Match` and `If-None-Match`.
+Use `If-Match` with the current ETag to replace an unchanged object, or
+`If-None-Match: *` to create an object only when the key is absent.
+A failed condition returns `412 PreconditionFailed`. A missing object with
+`If-Match` returns `404 NoSuchKey`.
+
+Writes to the same key are coordinated within one server. This is not a
+lock shared with other rclone servers or clients writing directly to the
+remote. Multipart data is staged separately before the condition is checked.
+
+On a local XFS filesystem with the exchange feature enabled, supported
+Linux kernels can conditionally exchange the staged data with an existing
+file. This path requires `--vfs-cache-mode off`, without symlink translation
+or following. An intervening inode change returns
+`409 ConditionalRequestConflict`; unavailable kernel or filesystem support
+uses the coordinated VFS path. Reads hold a lock until the response closes
+on this path so they cannot span an in-place exchange. XFS does not make
+metadata updates, path renames or independent remote writers transactional.
