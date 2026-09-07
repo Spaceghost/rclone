@@ -2,14 +2,15 @@ package s3
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"io"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/rclone/gofakes3"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/vfs"
 )
 
@@ -17,19 +18,45 @@ func (b *conditionalBackend) checkConditions(ctx context.Context, bucket, object
 	if conditions.invalid {
 		return false, gofakes3.ErrInvalidArgument
 	}
-	var etag string
-	obj, err := b.s3Backend.HeadObject(ctx, bucket, object)
+	v, err := b.s.getVFS(ctx)
 	if err != nil {
-		if !gofakes3.HasErrorCode(err, gofakes3.ErrNoSuchKey) {
-			return false, err
-		}
-	} else {
-		exists = true
-		etag = `"` + hex.EncodeToString(obj.Hash) + `"`
-		_ = obj.Contents.Close()
+		return false, err
 	}
+	if _, err = v.Stat(bucket); err != nil {
+		return false, gofakes3.BucketNotFound(bucket)
+	}
+	fp, err := bucketObjectPath(bucket, object)
+	if err != nil {
+		return false, err
+	}
+	node, err := v.Stat(fp)
+	if err != nil && !errors.Is(err, vfs.ENOENT) {
+		return false, err
+	}
+	exists = err == nil && node.IsFile()
 	if !exists && conditions.ifMatch != "" {
 		return false, gofakes3.KeyNotFound(object)
+	}
+
+	// Wildcards depend on existence, not on being able to read the object.
+	needsHash := false
+	for _, value := range []string{conditions.ifMatch, conditions.ifNoneMatch} {
+		value = strings.Trim(value, " \t")
+		needsHash = needsHash || (value != "" && value != "*")
+	}
+	var etag string
+	if exists && needsHash {
+		if b.s.etagHashType == hash.None || !v.Fs().Hashes().Contains(b.s.etagHashType) {
+			return true, gofakes3.ErrNotImplemented
+		}
+		sum := getFileHash(node, b.s.etagHashType)
+		if sum == "" {
+			return true, gofakes3.ErrInternal
+		}
+		etag = `"` + sum + `"`
+	}
+	if err := ctx.Err(); err != nil {
+		return exists, err
 	}
 	if !ifMatchHolds(conditions.ifMatch, exists, etag) || !ifNoneMatchHolds(conditions.ifNoneMatch, exists, etag) {
 		return exists, conditions.fail()
