@@ -1,0 +1,32 @@
+name: Export test workspace
+on:
+  push:
+    branches: ['workbench/serve-s3-ready']
+    paths: ['.github/workflows/export-test-workspace.yml']
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Resolve test dependencies
+        env:
+          CGO_ENABLED: 0
+        run: go list -deps -test ./lib/file ./backend/local ./cmd/serve/s3 > /dev/null
+      - name: Export source and dependencies
+        run: |
+          mkdir -p "$RUNNER_TEMP/workspace-export"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/workspace-export/source.tar.gz"
+          tar -C "$(go env GOROOT)" -czf "$RUNNER_TEMP/workspace-export/go.tar.gz" .
+          tar -C "$(go env GOMODCACHE)" -czf "$RUNNER_TEMP/workspace-export/modules.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conditional-write-workspace
+          path: ${{ runner.temp }}/workspace-export/*.tar.gz
+          retention-days: 1
+          compression-level: 0
