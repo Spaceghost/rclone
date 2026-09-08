@@ -68,6 +68,22 @@ jobs:
           fi
       - name: Race-test storage and encrypted snapshot restores
         run: go test -mod=readonly -race -count=1 ./lib/backup/... ./backend/backup/
+      - name: Run read-only backend integration profile
+        env:
+          GOFLAGS: -mod=readonly
+          RCLONE_CONFIG: /notfound
+        run: >-
+          go run ./fstest/test_all
+          -config backend/backup/testdata/integration.yaml
+          -backends backup -maxtries 1 -n 1 -timeout 10m
+          -output "$RUNNER_TEMP/backup-integration"
+      - name: Retain integration reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-integration-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-integration/
+          if-no-files-found: warn
       - name: Build one executable without cgo
         run: CGO_ENABLED=0 go build -mod=readonly -o "$RUNNER_TEMP/rclone-kopia" .
       - name: Install independent stock Kopia for fixture creation only

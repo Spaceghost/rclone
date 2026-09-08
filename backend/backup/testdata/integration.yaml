@@ -1,0 +1,13 @@
+# The backup backend is a read-only restore source. Its integration suite
+# provisions a disposable Kopia repository; no named remote is required.
+# Writable-destination operations/sync/bisync/VFS suites do not apply.
+tests:
+  - path: backend
+    addbackend: true
+    nobinary: true
+    noretries: true
+backends:
+  - backend: backup
+    remote: ""
+    tests:
+      - backend
