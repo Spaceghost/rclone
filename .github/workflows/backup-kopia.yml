@@ -1,0 +1,78 @@
+name: backup-kopia
+
+on:
+  push:
+    branches: [master, backup-kopia]
+    paths:
+      - 'lib/backup/**'
+      - 'backend/backup/**'
+      - 'bin/backup-kopia-smoke.sh'
+      - 'docs/data/backends/backup.yaml'
+      - '.github/workflows/backup-kopia.yml'
+      - 'go.mod'
+      - 'go.sum'
+  pull_request:
+    paths:
+      - 'lib/backup/**'
+      - 'backend/backup/**'
+      - 'bin/backup-kopia-smoke.sh'
+      - 'docs/data/backends/backup.yaml'
+      - '.github/workflows/backup-kopia.yml'
+      - 'go.mod'
+      - 'go.sum'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backup-kopia-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Pull-request checks cover the implementation branch; avoid duplicate jobs
+    # on its push event. After merging, master still gets these checks directly.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/master'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '~1.27.0'
+      - run: go test -mod=readonly -count=1 ./lib/backup/... ./backend/backup/
+
+  standalone:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '~1.27.0'
+      - name: Check formatting
+        run: |
+          files=$(gofmt -l lib/backup/kopiablob/*.go lib/backup/kopiarepo/*.go backend/backup/*.go)
+          if [ -n "$files" ]; then
+            printf 'Files requiring gofmt:\n%s\n' "$files"
+            exit 1
+          fi
+      - name: Race-test storage and encrypted snapshot restores
+        run: go test -mod=readonly -race -count=1 ./lib/backup/... ./backend/backup/
+      - name: Build one executable without cgo
+        run: CGO_ENABLED=0 go build -mod=readonly -o "$RUNNER_TEMP/rclone-kopia" .
+      - name: Install independent stock Kopia for fixture creation only
+        run: GOBIN="$RUNNER_TEMP/stock-kopia" go install github.com/kopia/kopia@v0.23.1
+      - name: Restore with no helper executable on PATH
+        run: bash bin/backup-kopia-smoke.sh "$RUNNER_TEMP/rclone-kopia" "$RUNNER_TEMP/stock-kopia/kopia"
+      - name: Ensure validation did not rewrite tracked files
+        run: git diff --exit-code
