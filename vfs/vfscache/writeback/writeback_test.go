@@ -348,6 +348,23 @@ func TestWriteBackAddFailRetry(t *testing.T) {
 	checkNotInLookup(t, wb, wbItem)
 }
 
+// Now test a remote change stopping retries
+func TestWriteBackAddObjectChanged(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+
+	pi := newPutItem(t)
+	id := wb.Add(0, "one", 10, true, pi.put)
+	wbItem := wb.lookup[id]
+
+	<-pi.started
+	pi.finish(fmt.Errorf("upload failed: %w", fs.ErrorObjectChanged))
+	waitUntilNoTransfers(t, wb)
+
+	checkNotOnHeap(t, wb, wbItem)
+	checkNotInLookup(t, wb, wbItem)
+}
+
 // Now test the upload being cancelled by another upload being added
 func TestWriteBackAddUpdate(t *testing.T) {
 	wb, cancel := newTestWriteBack(t)
