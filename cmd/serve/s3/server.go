@@ -88,13 +88,14 @@ func newServer(ctx context.Context, f fs.Fs, opt *Options, vfsOpt *vfscommon.Opt
 	}
 
 	w.backend = newBackend(w)
+	conditionalBackend := newConditionalBackend(w.backend)
 	if w.opt.MultipartExpiry > 0 {
 		w.backend.startReaper(time.Duration(w.opt.MultipartExpiry))
 	}
 
 	var newLogger logger
 	w.faker = gofakes3.New(
-		w.backend,
+		conditionalBackend,
 		gofakes3.WithHostBucket(!opt.ForcePathStyle),
 		gofakes3.WithLogger(newLogger),
 		gofakes3.WithRequestID(rand.Uint64()),
@@ -103,7 +104,7 @@ func newServer(ctx context.Context, f fs.Fs, opt *Options, vfsOpt *vfscommon.Opt
 		gofakes3.WithIntegrityCheck(true), // Check Content-MD5 if supplied
 	)
 
-	w.handler = w.faker.Server()
+	w.handler = conditionalWriteMiddleware(w.faker.Server())
 
 	if w.provider.IsProxy() {
 		w.handler = proxyAuthMiddleware(w.handler, w)

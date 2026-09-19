@@ -2,9 +2,9 @@
 //
 // Multipart uploads received by serve s3 are written, in part-number order,
 // through the VFS, exactly like a plain PutObject: to a temporary object
-// which is renamed into place on completion, so the object at the key only
-// ever changes atomically on success. With the default --vfs-cache-mode off
-// the parts stream through the VFS into a single upload to the remote; with
+// which is published at the final key on completion, so the object at the key
+// only changes on success. With the default --vfs-cache-mode off the parts
+// stream through the VFS into a single upload to the remote; with
 // --vfs-cache-mode writes or above they are buffered in the VFS cache and
 // uploaded by its write-back. This implements the gofakes3.MultipartBackend
 // interface on s3Backend.
@@ -51,7 +51,7 @@ const multipartUploadPrefix = tempObjectPrefix + "multipart_"
 type multipartUpload struct {
 	bucket, key string
 	fp          string // final object path
-	streamFp    string // path the parts are written to (fp when the remote has no server-side move or copy)
+	streamFp    string // temporary path the parts are written to
 	meta        map[string]string
 
 	fh  io.WriteCloser // sink the in-order parts are written to
@@ -119,18 +119,11 @@ func (b *s3Backend) loadUpload(uploadID gofakes3.UploadID) (*multipartUpload, er
 // CreateMultipartUpload begins a new multipart upload.
 //
 // The parts are written, in part-number order, through the VFS to a temporary
-// object which is renamed into place on completion. With the default
+// object which is published at the final key on completion. With the default
 // --vfs-cache-mode off the write streams through to the remote as the parts
 // arrive; with --vfs-cache-mode writes or above it lands in the VFS cache and
-// is uploaded by the write-back. Either way an aborted or failed upload never
-// makes a partial object visible at the final path or disturbs a pre-existing
-// one.
-//
-// On a remote with no server-side move or copy the parts are written straight
-// to the final object instead, trading some atomicity for never buffering in
-// memory: the in-flight upload is visible at the key, and a failed or aborted
-// upload can leave partial data there when the remote doesn't upload atomically
-// or the VFS is caching writes (a write to the cache can't be abandoned).
+// is uploaded by the write-back. Conditions arrive with completion, so the
+// parts must be staged even when the remote cannot move or copy server-side.
 //
 // With --disable-multipart-streaming, ErrMultipartUploadNotSupported is
 // returned so that gofakes3 falls back to buffering the whole upload in
@@ -164,17 +157,7 @@ func (b *s3Backend) CreateMultipartUpload(ctx context.Context, bucketName, objec
 	}
 
 	uploadID := gofakes3.UploadID(uuid.New().String())
-	streamFp := fp
-	// Write to a temporary object moved into place on completion if the
-	// remote supports server-side move (if not write directly to the final
-	// object). Unlike a plain PutObject all remotes use a temporary object.
-	// S3 semantics say the key must not show it until it completes. This is
-	// at the cost of a server-side copy and delete where the remote has no
-	// server side move.
-	if operations.CanServerSideMove(_vfs.Fs()) {
-		streamFp = path.Join(objectDir, multipartUploadPrefix+string(uploadID))
-	}
-
+	streamFp := path.Join(objectDir, multipartUploadPrefix+string(uploadID))
 	up := newMultipartUpload(bucketName, objectName, fp, streamFp, meta, int64(b.s.opt.MultipartStreamingBufferLimit))
 	fh, err := _vfs.Create(streamFp)
 	if err != nil {
@@ -375,9 +358,9 @@ func pipePart(w io.Writer, rw *pool.RW) error {
 }
 
 // CompleteMultipartUpload finalises a multipart upload. It closes the sink,
-// committing the upload, renames the temporary object into place, computes the
-// S3-style multipart ETag, and stores the user metadata so HeadObject and
-// GetObject see the same fields the in-memory PutObject path produces.
+// publishes the temporary object, computes the S3-style multipart ETag, and
+// stores the user metadata so HeadObject and GetObject see the same fields the
+// in-memory PutObject path produces.
 func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, objectName string, uploadID gofakes3.UploadID, input *gofakes3.CompleteMultipartUploadRequest) (gofakes3.VersionID, string, error) {
 	up, err := b.loadUpload(uploadID)
 	if err != nil {
@@ -403,16 +386,8 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, obj
 		return "", "", err
 	}
 
-	// Rename the temporary object into place: on a caching VFS the
-	// write-back then uploads it under the final name, otherwise it is
-	// moved server-side on the remote. On failure the upload record is
-	// kept, because gofakes3 keeps its own record when the backend errors
-	// so that the client can retry the CompleteMultipartUpload: the
-	// committed close is idempotent, so the retry just renames again.
-	if up.streamFp != up.fp {
-		if err := up.vfs.Rename(up.streamFp, up.fp); err != nil {
-			return "", "", err
-		}
+	if err := b.publishMultipartUpload(ctx, up); err != nil {
+		return "", "", err
 	}
 	b.multipartUploads.Delete(uploadID)
 
@@ -430,6 +405,34 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, obj
 	}
 
 	return "", up.multipartETag(input), nil
+}
+
+// publishMultipartUpload moves the staged object into place when possible,
+// otherwise it streams it through the normal PutObject path.
+func (b *s3Backend) publishMultipartUpload(ctx context.Context, up *multipartUpload) error {
+	if operations.CanServerSideMove(up.vfs.Fs()) {
+		return b.publishObject(ctx, up.vfs, up.streamFp, up.fp)
+	}
+
+	fi, err := up.vfs.Stat(up.streamFp)
+	if err != nil {
+		return err
+	}
+	in, err := up.vfs.Open(up.streamFp)
+	if err != nil {
+		return err
+	}
+	_, putErr := b.PutObject(ctx, up.bucket, up.key, up.meta, in, fi.Size())
+	closeErr := in.Close()
+	if putErr != nil {
+		return putErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+
+	b.forgetPath(up.vfs, up.streamFp)
+	return up.vfs.Remove(up.streamFp)
 }
 
 // AbortMultipartUpload tears down an in-progress upload, discarding any data
@@ -495,17 +498,9 @@ func (b *s3Backend) reapExpiredUploads(now time.Time, expiry time.Duration) {
 }
 
 // discardUpload cleans up after a failed or aborted upload, removing the
-// temporary object and any stale VFS state for it. It never removes the
-// object at the final path: when the parts were written straight to the
-// final object (a remote with no server-side move or copy) it may hold a
-// pre-existing object the abandoned streaming write never disturbed, so
-// only the VFS's view of the path is refreshed. (A caching VFS on such a
-// remote commits the partial data instead - see abort.)
+// temporary object and any stale VFS state for it.
 func (b *s3Backend) discardUpload(up *multipartUpload) {
 	b.forgetPath(up.vfs, up.streamFp)
-	if up.streamFp == up.fp {
-		return
-	}
 	_ = up.vfs.Remove(up.streamFp)
 }
 
@@ -586,9 +581,7 @@ var errMultipartAborted = errors.New("serve s3: multipart upload aborted")
 // abort tears down the upload and releases any buffered parts. The write is
 // abandoned so nothing is committed; a sink which can't abandon (a caching
 // one) is closed normally, committing what it has to the cache - the caller
-// then removes its temporary file, except on a remote with no server-side
-// move or copy, where the parts went straight to the final path and the
-// partial data is left to be written back.
+// then removes its temporary file.
 func (up *multipartUpload) abort() error {
 	up.mu.Lock()
 	if up.closed {
