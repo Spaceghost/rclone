@@ -19,5 +19,15 @@ GOOS=darwin GOARCH=arm64 contrib/melodica/build-private.sh build/melodica-rclone
 GOOS=linux GOARCH=arm64 contrib/melodica/build-private.sh build/melodica-rclone-linux-arm64
 ```
 
+Or build the full capability-gated release matrix and checksum manifest:
+
+```sh
+contrib/melodica/build-private.sh --matrix
+```
+
+The matrix covers Windows x64/ARM64, macOS ARM64, Linux x64/ARM64, and Android
+ARM64. iOS consumes the native `melodica.h` library inside its app sandbox and
+does not receive a standalone rclone executable.
+
 Private binary artifacts must include `COPYING`, the exact source revision,
 and a corresponding-source offer. rclone remains GPLv3 software.
