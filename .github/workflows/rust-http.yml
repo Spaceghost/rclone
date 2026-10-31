@@ -1,0 +1,70 @@
+---
+name: Rust HTTP
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rust-http.yml'
+      - 'fs/fshttp/**'
+      - 'fs/accounting/**'
+      - 'go.mod'
+      - 'go.sum'
+  pull_request:
+    paths:
+      - '.github/workflows/rust-http.yml'
+      - 'fs/fshttp/**'
+      - 'fs/accounting/**'
+      - 'go.mod'
+      - 'go.sum'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: '1'
+      RCLONE_CONFIG: /notfound
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build without Rust or cgo
+        env:
+          CGO_ENABLED: '0'
+        run: go build -o "$RUNNER_TEMP/rclone-go" .
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: Check Rust formatting
+        run: rustup run stable cargo fmt --manifest-path fs/fshttp/rust/Cargo.toml --all --check
+
+      - name: Test Rust engine
+        run: rustup run stable cargo test --release --locked --manifest-path fs/fshttp/rust/Cargo.toml
+
+      - name: Build Rust static library
+        run: rustup run stable cargo build --release --locked --manifest-path fs/fshttp/rust/Cargo.toml
+
+      - name: Build with Rust HTTP
+        run: go build -tags rusthttp -o "$RUNNER_TEMP/rclone-rust" .
+
+      - name: Check transport and bandwidth concurrency
+        run: go test -race -tags rusthttp ./fs/fshttp ./fs/accounting
