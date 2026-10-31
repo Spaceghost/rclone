@@ -297,7 +297,9 @@ func NewTransportCustom(ctx context.Context, customize func(*http.Transport)) *T
 	}
 
 	// Wrap that http.Transport in our own transport
-	return newTransport(ci, t)
+	wrapped := newTransport(ci, t)
+	wrapped.engine = selectRustHTTPTransport(ctx, t, customize != nil)
+	return wrapped
 }
 
 // NewTransport returns an http.RoundTripper with the correct timeouts
@@ -343,6 +345,7 @@ func NewClientWithUnixSocket(ctx context.Context, path string) *http.Client {
 // * Updates metrics
 type Transport struct {
 	*http.Transport
+	engine        http.RoundTripper
 	ci            *fs.ConfigInfo
 	dump          fs.DumpFlags
 	filterRequest func(req *http.Request)
@@ -351,6 +354,14 @@ type Transport struct {
 	metrics       *Metrics
 	// Mutex for serializing attempts at reloading the certificates
 	reloadMutex sync.Mutex
+}
+
+// CloseIdleConnections closes idle connections in each configured HTTP engine.
+func (t *Transport) CloseIdleConnections() {
+	t.Transport.CloseIdleConnections()
+	if engine, ok := t.engine.(interface{ CloseIdleConnections() }); ok {
+		engine.CloseIdleConnections()
+	}
 }
 
 // newTransport wraps the http.Transport passed in and logs all
@@ -697,7 +708,11 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	// Do round trip unless a fault is being injected
 	resp, err = injectFault(traceReq)
 	if resp == nil && err == nil {
-		resp, err = t.Transport.RoundTrip(traceReq)
+		if t.engine == nil {
+			resp, err = t.Transport.RoundTrip(traceReq)
+		} else {
+			resp, err = t.engine.RoundTrip(traceReq)
+		}
 	}
 	// Dump response, and the request too if we deferred it for --dump errors
 	if wantDump && (!onError || isRetryableResponse(resp, err)) {

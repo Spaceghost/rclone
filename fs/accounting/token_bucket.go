@@ -173,17 +173,28 @@ func (tb *tokenBucket) StartTokenTicker(ctx context.Context) {
 // LimitBandwidth sleeps for the correct amount of time for the passage
 // of n bytes according to the current bandwidth limit
 func (tb *tokenBucket) LimitBandwidth(i TokenBucketSlot, n int) {
-	tb.mu.RLock()
-
-	// Limit the transfer speed if required
-	if tb.curr[i] != nil {
-		err := tb.curr[i].WaitN(context.Background(), n)
-		if err != nil {
-			fs.Errorf(nil, "Token bucket error: %v", err)
-		}
+	if err := tb.LimitBandwidthContext(context.Background(), i, n); err != nil {
+		fs.Errorf(nil, "Token bucket error: %v", err)
 	}
+}
 
+// LimitBandwidthContext waits for bandwidth or cancellation.
+// Limit changes apply to subsequent waits; pending waits retain their limiter.
+func (tb *tokenBucket) LimitBandwidthContext(ctx context.Context, i TokenBucketSlot, n int) error {
+	tb.mu.RLock()
+	limiter := tb.curr[i]
 	tb.mu.RUnlock()
+	if limiter == nil {
+		return nil
+	}
+	return limiter.WaitN(ctx, n)
+}
+
+// TransportBandwidthLimited reports whether a transport bandwidth limit is active.
+func (tb *tokenBucket) TransportBandwidthLimited() bool {
+	tb.mu.RLock()
+	defer tb.mu.RUnlock()
+	return tb.curr[TokenBucketSlotTransportRx] != nil || tb.curr[TokenBucketSlotTransportTx] != nil
 }
 
 // SetBwLimit sets the current bandwidth limit
