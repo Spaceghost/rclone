@@ -81,6 +81,7 @@ type Info struct {
 	Rs          ranges.Ranges // which parts of the file are present
 	Fingerprint string        // fingerprint of remote object
 	Dirty       bool          // set if the backing file has been modified
+	Conflict    bool          // set if writeback found the remote object changed
 }
 
 // Items are a slice of *Item ordered by ATime
@@ -648,6 +649,12 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 			o, err = operations.Copy(ctx, item.c.fremote, o, name, cacheObj)
 		})
 		if err != nil {
+			if errors.Is(err, fs.ErrorObjectChanged) {
+				item.info.Conflict = true
+				if saveErr := item._save(); saveErr != nil {
+					return fmt.Errorf("vfs cache: failed to save conflict state: %w", saveErr)
+				}
+			}
 			if errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
 				fs.Errorf(name, "Writeback failed: %v", err)
 				return nil
@@ -672,6 +679,7 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 
 	// Show item is clean and is eligible for cache removal
 	item.info.Dirty = false
+	item.info.Conflict = false
 	err = item._save()
 	if err != nil {
 		fs.Errorf(item.name, "vfs cache: failed to write metadata file: %v", err)
@@ -821,7 +829,7 @@ func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) 
 	}
 
 	// upload the file to backing store if changed
-	if item.info.Dirty {
+	if item.info.Dirty && !item.info.Conflict {
 		fs.Infof(item.name, "vfs cache: queuing for upload in %v", item.c.opt.WriteBack)
 		if syncWriteBack {
 			// do synchronous writeback
@@ -853,21 +861,26 @@ func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) 
 func (item *Item) reload(ctx context.Context) error {
 	item.mu.Lock()
 	dirty := item.info.Dirty
+	conflict := item.info.Conflict
 	item.mu.Unlock()
 	if !dirty {
 		return nil
 	}
-	// see if the object still exists
-	obj, _ := item.c.fremote.NewObject(ctx, item.name)
-	// open the file with the object (or nil)
-	err := item.Open(obj)
-	if err != nil {
-		return err
-	}
-	// close the file to execute the writeback if needed
-	err = item.Close(nil)
-	if err != nil {
-		return err
+	if conflict {
+		fs.Errorf(item.name, "vfs cache: writeback conflict - keeping local file")
+	} else {
+		// see if the object still exists
+		obj, _ := item.c.fremote.NewObject(ctx, item.name)
+		// open the file with the object (or nil)
+		err := item.Open(obj)
+		if err != nil {
+			return err
+		}
+		// close the file to execute the writeback if needed
+		err = item.Close(nil)
+		if err != nil {
+			return err
+		}
 	}
 	// put the file into the directory listings
 	size, err := item._getSize()
