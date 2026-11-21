@@ -14,7 +14,7 @@ start() {
            -e "MINIO_ACCESS_KEY=$USER" \
            -e "MINIO_SECRET_KEY=$PASS" \
            -p 127.0.0.1:${PORT}:9000 \
-           minio/minio server /data
+           pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372 server /data || return
     
     echo type=s3
     echo provider=Minio
