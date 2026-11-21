@@ -49,11 +49,11 @@ func TestXFSCommitRangeUAPI(t *testing.T) {
 	out, err = exec.Command(binary).CombinedOutput()
 	require.NoError(t, err, "%s", out)
 	var args xfsCommitRange
-	want := fmt.Sprintf("%d %d %d %d %d %d %d %d %d %d %d %d",
+	want := fmt.Sprintf("%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
 		unsafe.Sizeof(args), unsafe.Offsetof(args.File1FD), unsafe.Offsetof(args.Pad),
 		unsafe.Offsetof(args.File1Offset), unsafe.Offsetof(args.File2Offset),
 		unsafe.Offsetof(args.Length), unsafe.Offsetof(args.Flags), unsafe.Offsetof(args.File2Freshness),
-		xfsIOCStartCommit, xfsIOCCommitRange, xfsExchangeRangeToEOF, xfsExchangeRangeDSync)
+		xfsIOCStartCommit, xfsIOCCommitRange, xfsExchangeRangeToEOF, xfsExchangeRangeDSync, unsafe.Sizeof(xfsGeometry{}), unsafe.Offsetof(xfsGeometry{}.Flags), xfsIOCGeometry, xfsGeometryExchangeRange)
 	assert.Equal(t, want, strings.TrimSpace(string(out)))
 }
 

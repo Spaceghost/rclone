@@ -3,10 +3,13 @@ package s3
 import (
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/rclone/gofakes3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -17,7 +20,7 @@ func TestConditionalRejectedKeys(t *testing.T) {
 			b, _ := newTestBackend(t)
 			cb := newConditionalBackend(b)
 			etag := objectETag(t, b, "bucket", "object.txt")
-			ctx, _ := conditionalContext("", "*")
+			ctx := conditionalContext("", "*")
 			_, err := cb.PutObject(ctx, "bucket", key, map[string]string{}, strings.NewReader("replacement"), 11)
 			require.Error(t, err)
 			assert.Equal(t, etag, objectETag(t, b, "bucket", "object.txt"))
@@ -78,6 +81,9 @@ func TestConditionalCopyLockOrder(t *testing.T) {
 func TestConditionalIndependentKeys(t *testing.T) {
 	b, _ := newTestBackend(t)
 	cb := newConditionalBackend(b)
+	if cb.objectLockKey(context.Background(), "bucket", "other") == cb.objectLockKey(context.Background(), "bucket", "object.txt") {
+		t.Skip("backend coordinates the entire namespace")
+	}
 	cb.xfs = true
 	obj, err := cb.GetObject(context.Background(), "bucket", "object.txt", nil)
 	require.NoError(t, err)
@@ -98,4 +104,73 @@ func TestConditionalIndependentKeys(t *testing.T) {
 	assert.Equal(t, "normal object", string(got))
 	require.NoError(t, obj.Contents.Close())
 	assert.Empty(t, cb.locks.locks)
+}
+
+func TestConditionalCanceledWriter(t *testing.T) {
+	b, _ := newTestBackend(t)
+	cb := newConditionalBackend(b)
+	cb.xfs = true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	obj, err := cb.GetObject(ctx, "bucket", "object.txt", nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = obj.Contents.Close() })
+	done := make(chan error, 1)
+	go func() {
+		_, err := cb.PutObject(ctx, "bucket", "object.txt", nil, strings.NewReader("x"), 1)
+		done <- err
+	}()
+	key := cb.objectLockKey(ctx, "bucket", "object.txt")
+	require.Eventually(t, func() bool { cb.locks.mu.Lock(); defer cb.locks.mu.Unlock(); return cb.locks.locks[key].refs == 2 }, 5*time.Second, time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled writer still waiting for GET")
+	}
+	require.NoError(t, obj.Contents.Close())
+	require.Empty(t, cb.locks.locks)
+}
+
+func TestConditionalCaseInsensitiveAliases(t *testing.T) {
+	b, root := newTestBackend(t)
+	original, err := os.Stat(filepath.Join(root, "bucket", "object.txt"))
+	require.NoError(t, err)
+	alias, err := os.Stat(filepath.Join(root, "bucket", "OBJECT.TXT"))
+	if os.IsNotExist(err) {
+		t.Skip("requires a case-insensitive filesystem")
+	}
+	require.NoError(t, err)
+	require.True(t, os.SameFile(original, alias))
+	b.s.provider.VFS().Opt.CaseInsensitive = true
+	cb := newConditionalBackend(b)
+	ctx := conditionalContext(objectETag(t, b, "bucket", "object.txt"), "")
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	first, second := make(chan error, 1), make(chan error, 1)
+	go func() {
+		_, err := cb.PutObject(ctx, "bucket", "object.txt", map[string]string{}, reader, 2)
+		first <- err
+	}()
+	// The first byte is consumed after the first writer has checked its ETag.
+	_, err = writer.Write([]byte("a"))
+	require.NoError(t, err)
+	go func() {
+		_, err := cb.PutObject(ctx, "bucket", "OBJECT.TXT", map[string]string{}, strings.NewReader("b"), 1)
+		second <- err
+	}()
+	key := cb.objectLockKey(ctx, "bucket", "object.txt")
+	require.Eventually(t, func() bool {
+		cb.locks.mu.Lock()
+		defer cb.locks.mu.Unlock()
+		lock := cb.locks.locks[key]
+		return lock != nil && lock.refs == 2
+	}, 5*time.Second, time.Millisecond)
+	_, err = writer.Write([]byte("a"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	require.NoError(t, <-first)
+	require.ErrorIs(t, <-second, gofakes3.ErrPreconditionFailed)
 }

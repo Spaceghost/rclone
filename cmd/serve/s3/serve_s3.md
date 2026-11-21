@@ -390,12 +390,19 @@ A failed condition returns `412 PreconditionFailed`. A missing object with
 
 Writes to the same key are coordinated within one server. This is not a
 lock shared with other rclone servers or clients writing directly to the
-remote. Multipart data is staged separately before the condition is checked.
+remote. On a case-insensitive local mount on Linux, use
+`--local-case-insensitive --vfs-case-insensitive` so rclone coordinates
+alternate spellings of the same name. Multipart data is staged separately
+before the condition is checked. Auth-proxy servers return
+`501 NotImplemented` for conditional writes because users may have separate
+VFS caches for the same remote.
 
 On a local XFS filesystem with the exchange feature enabled, supported
 Linux kernels can conditionally exchange the staged data with an existing
 file. This path requires `--vfs-cache-mode off`, without symlink translation
-or following. An intervening inode change returns
+or following. Files with multiple hard links or different permissions, owners
+or extended attributes from the staging file use normal VFS publication.
+An intervening inode change returns
 `409 ConditionalRequestConflict`; unavailable kernel or filesystem support
 uses the coordinated VFS path. Reads hold a lock until the response closes
 on this path so they cannot span an in-place exchange. XFS does not make

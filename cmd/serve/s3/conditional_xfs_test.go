@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	filelib "github.com/rclone/rclone/lib/file"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 type mutateOnRead struct {
@@ -84,7 +86,7 @@ func TestConditionalXFSConflict(t *testing.T) {
 		t.Run(mutation, func(t *testing.T) {
 			cb, root := newConditionalXFSBackend(t)
 			name := filepath.Join(root, "bucket", "object.txt")
-			ctx, _ := conditionalContext(objectETag(t, cb.s3Backend, "bucket", "object.txt"), "")
+			ctx := conditionalContext(objectETag(t, cb.s3Backend, "bucket", "object.txt"), "")
 			var want []byte
 			input := &mutateOnRead{reader: strings.NewReader("replacement"), mutate: func() {
 				switch mutation {
@@ -114,7 +116,7 @@ func TestConditionalXFSConflict(t *testing.T) {
 				require.NoError(t, err)
 			}}
 			_, err := cb.PutObject(ctx, "bucket", "object.txt", map[string]string{}, input, 11)
-			require.ErrorIs(t, err, errConditionalRequestConflict)
+			require.ErrorIs(t, err, gofakes3.ErrConditionalRequestConflict)
 			got, err := os.ReadFile(name)
 			if mutation == "Delete" {
 				assert.True(t, os.IsNotExist(err))
@@ -134,12 +136,12 @@ func TestConditionalXFSPublication(t *testing.T) {
 			cb := newConditionalBackend(b)
 			mode := os.Getenv("RCLONE_TEST_XFS_EXCHANGE")
 			if mode != "" {
-				require.True(t, cb.xfs, "XFS temporary directory required")
+				require.Equal(t, mode == "1", cb.xfs, "XFS exchange capability")
 			}
 			name := filepath.Join(root, "bucket", "object.txt")
 			before, err := os.Stat(name)
 			require.NoError(t, err)
-			ctx, _ := conditionalContext(objectETag(t, b, "bucket", "object.txt"), "")
+			ctx := conditionalContext(objectETag(t, b, "bucket", "object.txt"), "")
 			switch method {
 			case "Put":
 				_, err = cb.PutObject(ctx, "bucket", "object.txt", map[string]string{}, strings.NewReader("replacement"), 11)
@@ -187,7 +189,7 @@ func TestConditionalXFSFallback(t *testing.T) {
 				}
 				require.NoError(t, os.Chmod(name, 0444))
 			}
-			ctx, _ := conditionalContext(objectETag(t, cb.s3Backend, "bucket", "object.txt"), "")
+			ctx := conditionalContext(objectETag(t, cb.s3Backend, "bucket", "object.txt"), "")
 			_, err = cb.PutObject(ctx, "bucket", "object.txt", map[string]string{}, strings.NewReader("replacement"), 11)
 			require.NoError(t, err)
 			after, err := os.Stat(name)
@@ -213,7 +215,7 @@ func TestConditionalXFSStagingAliases(t *testing.T) {
 			v := cb.s.provider.VFS()
 			guard, err := startXFSCommitGuard(v.Fs(), "bucket/object.txt")
 			require.NoError(t, err)
-			defer func() { require.NoError(t, guard.close()) }()
+			defer func() { require.NoError(t, guard.Close()) }()
 			victim := filepath.Join(root, "bucket", "victim")
 			staging := filepath.Join(root, "bucket", "staging")
 			require.NoError(t, os.WriteFile(victim, []byte("not staging"), 0600))
@@ -222,7 +224,7 @@ func TestConditionalXFSStagingAliases(t *testing.T) {
 			} else {
 				require.NoError(t, os.Symlink(victim, staging))
 			}
-			require.Error(t, guard.commit(v.Fs(), "bucket/staging", false))
+			require.Error(t, guard.Publish("bucket/staging"))
 			got, err := os.ReadFile(filepath.Join(root, "bucket", "object.txt"))
 			require.NoError(t, err)
 			assert.Equal(t, "normal object", string(got))
@@ -242,9 +244,9 @@ func TestConditionalXFSFreshHash(t *testing.T) {
 	want := bytes.Repeat([]byte("x"), int(info.Size()))
 	require.NoError(t, os.WriteFile(name, want, 0600))
 	require.NoError(t, os.Chtimes(name, info.ModTime(), info.ModTime()))
-	ctx, _ := conditionalContext(etag, "")
+	ctx := conditionalContext(etag, "")
 	_, err = cb.PutObject(ctx, "bucket", "object.txt", map[string]string{}, strings.NewReader("replacement"), 11)
-	require.ErrorIs(t, err, errPreconditionFailed)
+	require.ErrorIs(t, err, gofakes3.ErrPreconditionFailed)
 	got, err := os.ReadFile(name)
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
@@ -255,7 +257,7 @@ func TestConditionalXFSFailedUpload(t *testing.T) {
 	for _, kind := range []string{"ShortBody", "Canceled"} {
 		t.Run(kind, func(t *testing.T) {
 			cb, root := newConditionalXFSBackend(t)
-			conditional, _ := conditionalContext(objectETag(t, cb.s3Backend, "bucket", "object.txt"), "")
+			conditional := conditionalContext(objectETag(t, cb.s3Backend, "bucket", "object.txt"), "")
 			ctx, cancel := context.WithCancel(conditional)
 			defer cancel()
 			var input io.Reader = strings.NewReader("short")
@@ -276,7 +278,7 @@ func TestConditionalXFSFailedUpload(t *testing.T) {
 
 func TestConditionalXFSReader(t *testing.T) {
 	cb, _ := newConditionalXFSBackend(t)
-	ctx, _ := conditionalContext(objectETag(t, cb.s3Backend, "bucket", "object.txt"), "")
+	ctx := conditionalContext(objectETag(t, cb.s3Backend, "bucket", "object.txt"), "")
 	obj, err := cb.GetObject(context.Background(), "bucket", "object.txt", nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = obj.Contents.Close() })
@@ -291,7 +293,7 @@ func TestConditionalXFSReader(t *testing.T) {
 	require.Eventually(t, func() bool {
 		cb.locks.mu.Lock()
 		defer cb.locks.mu.Unlock()
-		return cb.locks.locks[objectLockKey("bucket", "object.txt")].refs == 2
+		return cb.locks.locks[cb.objectLockKey(ctx, "bucket", "object.txt")].refs == 2
 	}, 5*time.Second, time.Millisecond)
 	select {
 	case err := <-done:
@@ -340,9 +342,9 @@ func TestConditionalXFSMultipartRetry(t *testing.T) {
 	up.fh = &mutateOnClose{WriteCloser: up.fh, mutate: func() {
 		require.NoError(t, os.WriteFile(name, []byte("changed elsewhere"), 0600))
 	}}
-	conditional, _ := conditionalContext(objectETag(t, b, "bucket", "object.txt"), "")
+	conditional := conditionalContext(objectETag(t, b, "bucket", "object.txt"), "")
 	_, _, err = cb.CompleteMultipartUpload(conditional, "bucket", "object.txt", id, &input)
-	require.ErrorIs(t, err, errConditionalRequestConflict)
+	require.ErrorIs(t, err, gofakes3.ErrConditionalRequestConflict)
 	got, err := os.ReadFile(name)
 	require.NoError(t, err)
 	assert.Equal(t, "changed elsewhere", string(got))
@@ -352,7 +354,7 @@ func TestConditionalXFSMultipartRetry(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "replacement", string(got))
 	b.forgetPath(up.vfs, up.fp)
-	conditional, _ = conditionalContext(objectETag(t, b, "bucket", "object.txt"), "")
+	conditional = conditionalContext(objectETag(t, b, "bucket", "object.txt"), "")
 	_, _, err = cb.CompleteMultipartUpload(conditional, "bucket", "object.txt", id, &input)
 	require.NoError(t, err)
 	_, err = cb.loadUpload(id)
@@ -388,11 +390,64 @@ func TestConditionalXFSRootConfinement(t *testing.T) {
 	assert.Nil(t, guard)
 	guard, err = startXFSCommitGuard(b.s.provider.VFS().Fs(), "bucket/object.txt")
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = guard.close() })
-	assert.Error(t, guard.commit(b.s.provider.VFS().Fs(), "bucket/escape/victim", false))
+	t.Cleanup(func() { _ = guard.Close() })
+	assert.Error(t, guard.Publish("bucket/escape/victim"))
 	got, err := os.ReadFile(victim)
 	require.NoError(t, err)
 	assert.Equal(t, "outside", string(got))
-	require.NoError(t, guard.close())
-	require.NoError(t, guard.close())
+	require.NoError(t, guard.Close())
+	require.NoError(t, guard.Close())
+}
+
+func TestConditionalXFSMetadata(t *testing.T) {
+	for _, kind := range []string{"Mode", "Xattr", "ACL", "Owner"} {
+		t.Run(kind, func(t *testing.T) {
+			cb, root := newConditionalXFSBackend(t)
+			for _, key := range []string{"exchange", "rename"} {
+				name := filepath.Join(root, "bucket", key)
+				require.NoError(t, os.WriteFile(name, []byte("old"), 0666))
+				switch kind {
+				case "Mode":
+					require.NoError(t, os.Chmod(name, 0600))
+				case "Xattr":
+					require.NoError(t, unix.Setxattr(name, "user.test", []byte("old"), 0))
+				case "ACL":
+					tool, err := exec.LookPath("setfacl")
+					if err != nil {
+						t.Skip("requires setfacl")
+					}
+					out, err := exec.Command(tool, "-m", "u:65534:r--", name).CombinedOutput()
+					require.NoError(t, err, "%s", out)
+				case "Owner":
+					if os.Geteuid() != 0 {
+						t.Skip("requires chown")
+					}
+					require.NoError(t, os.Chown(name, 65534, 65534))
+				}
+				before, err := os.Stat(name)
+				require.NoError(t, err)
+				cb.xfs = key == "exchange"
+				cb.forgetPath(cb.s.provider.VFS(), "bucket/"+key)
+				ctx := conditionalContext("*", "")
+				_, err = cb.PutObject(ctx, "bucket", key, map[string]string{}, strings.NewReader("replacement"), 11)
+				require.NoError(t, err)
+				after, err := os.Stat(name)
+				require.NoError(t, err)
+				require.False(t, os.SameFile(before, after))
+			}
+			path := func(key string) string { return filepath.Join(root, "bucket", key) }
+			var x, r unix.Stat_t
+			require.NoError(t, unix.Stat(path("exchange"), &x))
+			require.NoError(t, unix.Stat(path("rename"), &r))
+			assert.Equal(t, r.Mode, x.Mode)
+			assert.Equal(t, r.Uid, x.Uid)
+			assert.Equal(t, r.Gid, x.Gid)
+			for _, name := range []string{"user.test", "system.posix_acl_access"} {
+				for _, key := range []string{"exchange", "rename"} {
+					_, err := unix.Getxattr(path(key), name, nil)
+					require.ErrorIs(t, err, unix.ENODATA)
+				}
+			}
+		})
+	}
 }

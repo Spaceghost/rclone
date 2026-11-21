@@ -5,25 +5,29 @@ import (
 	"errors"
 	"io"
 	"os"
-	"strings"
 	"syscall"
 
 	"github.com/rclone/gofakes3"
+	"github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/vfs"
 )
 
-func (b *conditionalBackend) checkConditions(ctx context.Context, bucket, object string, conditions *writeConditions) (exists bool, err error) {
-	if conditions.invalid {
-		return false, gofakes3.ErrInvalidArgument
-	}
-	v, err := b.s.getVFS(ctx)
-	if err != nil {
-		return false, err
-	}
+type xfsCommitKey struct{}
+
+// SupportsWriteConditions reports that writes validate the destination under its lock.
+func (b *conditionalBackend) SupportsWriteConditions() bool {
+	// Distinct proxy VFS instances may cache different versions of one object.
+	return b.s.provider.VFS() != nil
+}
+
+func (b *conditionalBackend) checkConditions(ctx context.Context, v *vfs.VFS, bucket, object string, conditions *gofakes3.WriteConditions) (exists bool, err error) {
 	if _, err = v.Stat(bucket); err != nil {
-		return false, gofakes3.BucketNotFound(bucket)
+		if errors.Is(err, vfs.ENOENT) {
+			return false, gofakes3.BucketNotFound(bucket)
+		}
+		return false, err
 	}
 	fp, err := bucketObjectPath(bucket, object)
 	if err != nil {
@@ -33,23 +37,32 @@ func (b *conditionalBackend) checkConditions(ctx context.Context, bucket, object
 	if err != nil && !errors.Is(err, vfs.ENOENT) {
 		return false, err
 	}
+	if errors.Is(err, vfs.ENOENT) && (v.Fs().Features().CaseInsensitive || v.Fs().Features().IsLocal) {
+		// A VFS listing can miss a spelling the backing filesystem accepts.
+		// Treating that name as absent would let a create-only request replace it.
+		_, lookupErr := v.Fs().NewObject(ctx, fp)
+		switch {
+		case lookupErr == nil:
+			return true, gofakes3.ErrInvalidArgument
+		case errors.Is(lookupErr, fs.ErrorObjectNotFound), errors.Is(lookupErr, fs.ErrorIsDir):
+		default:
+			return false, lookupErr
+		}
+	}
 	exists = err == nil && node.IsFile()
-	if !exists && conditions.ifMatch != "" {
-		return false, gofakes3.KeyNotFound(object)
-	}
-
-	// Wildcards depend on existence, not on being able to read the object.
-	needsHash := false
-	for _, value := range []string{conditions.ifMatch, conditions.ifNoneMatch} {
-		value = strings.Trim(value, " \t")
-		needsHash = needsHash || (value != "" && value != "*")
-	}
 	var etag string
-	if exists && needsHash {
+	if exists && conditions.NeedsETag() {
 		if b.s.etagHashType == hash.None || !v.Fs().Hashes().Contains(b.s.etagHashType) {
 			return true, gofakes3.ErrNotImplemented
 		}
-		sum := getFileHash(node, b.s.etagHashType)
+		sum, err := readFileHash(ctx, node, b.s.etagHashType)
+		if err != nil {
+			if errors.Is(err, hash.ErrUnsupported) {
+				return true, gofakes3.ErrNotImplemented
+			}
+			fs.Errorf(node, "Failed to read destination ETag: %v", err)
+			return true, gofakes3.ErrInternal
+		}
 		if sum == "" {
 			return true, gofakes3.ErrInternal
 		}
@@ -58,17 +71,14 @@ func (b *conditionalBackend) checkConditions(ctx context.Context, bucket, object
 	if err := ctx.Err(); err != nil {
 		return exists, err
 	}
-	if !ifMatchHolds(conditions.ifMatch, exists, etag) || !ifNoneMatchHolds(conditions.ifNoneMatch, exists, etag) {
-		return exists, conditions.fail()
-	}
-	return exists, nil
+	return exists, conditions.Check(exists, etag)
 }
 
-func (b *conditionalBackend) beginConditionalWrite(ctx context.Context, v *vfs.VFS, bucket, object string) (guard *xfsCommitGuard, err error) {
+func (b *conditionalBackend) beginConditionalWrite(ctx context.Context, v *vfs.VFS, bucket, object string) (guard *local.XFSCommit, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	conditions := conditionsFromContext(ctx)
+	conditions := gofakes3.WriteConditionsFromContext(ctx)
 	if conditions == nil {
 		return nil, nil
 	}
@@ -87,23 +97,21 @@ func (b *conditionalBackend) beginConditionalWrite(ctx context.Context, v *vfs.V
 			b.forgetPath(v, fp)
 		}
 	}
-	exists, err := b.checkConditions(ctx, bucket, object, conditions)
+	exists, err := b.checkConditions(ctx, v, bucket, object, conditions)
 	if err != nil || !exists {
-		_ = guard.close()
+		_ = guard.Close()
 		guard = nil
 	}
-	conditions.guard = guard
 	return guard, err
 }
 
-// publishObject uses the existing upload staging path for both publication methods.
+// publishObject installs a completed staging object at its destination.
 func (b *s3Backend) publishObject(ctx context.Context, v *vfs.VFS, staging, target string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	conditions := conditionsFromContext(ctx)
-	if conditions != nil && conditions.guard != nil {
-		err := conditions.guard.commit(v.Fs(), staging, false)
+	if guard, _ := ctx.Value(xfsCommitKey{}).(*local.XFSCommit); guard != nil {
+		err := guard.Publish(staging)
 		switch {
 		case err == nil:
 			// Staging contains the old contents after the exchange.
@@ -114,18 +122,20 @@ func (b *s3Backend) publishObject(ctx context.Context, v *vfs.VFS, staging, targ
 			}
 			return nil
 		case errors.Is(err, syscall.EBUSY):
-			return conditions.conflict()
+			return gofakes3.ErrConditionalRequestConflict
 		case !xfsCommitUnavailable(err):
 			return err
 		}
-		// START_COMMIT can succeed on filesystems without the exchange feature.
-		// Keep the staged data and use the coordinated VFS publication path.
+		// The staged inode carries the metadata that rename must publish.
 	}
 	return v.Rename(staging, target)
 }
 
 func (b *conditionalBackend) PutObject(ctx context.Context, bucket, object string, meta map[string]string, input io.Reader, size int64) (result gofakes3.PutObjectResult, err error) {
-	unlock := b.locks.write(objectLockKey(bucket, object))
+	unlock, err := b.locks.lock(ctx, b.objectLockKey(ctx, bucket, object), writeWeight)
+	if err != nil {
+		return result, err
+	}
 	defer unlock()
 	v, err := b.s.getVFS(ctx)
 	if err != nil {
@@ -135,12 +145,18 @@ func (b *conditionalBackend) PutObject(ctx context.Context, bucket, object strin
 	if err != nil {
 		return result, err
 	}
-	defer func() { _ = guard.close() }()
+	if guard != nil {
+		defer func() { _ = guard.Close() }()
+		ctx = context.WithValue(ctx, xfsCommitKey{}, guard)
+	}
 	return b.s3Backend.PutObject(ctx, bucket, object, meta, input, size)
 }
 
 func (b *conditionalBackend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, meta map[string]string) (result gofakes3.CopyObjectResult, err error) {
-	unlock := b.lockCopy(srcBucket, srcKey, dstBucket, dstKey)
+	unlock, err := b.lockCopy(ctx, srcBucket, srcKey, dstBucket, dstKey)
+	if err != nil {
+		return result, err
+	}
 	defer unlock()
 	v, err := b.s.getVFS(ctx)
 	if err != nil {
@@ -150,12 +166,18 @@ func (b *conditionalBackend) CopyObject(ctx context.Context, srcBucket, srcKey, 
 	if err != nil {
 		return result, err
 	}
-	defer func() { _ = guard.close() }()
+	if guard != nil {
+		defer func() { _ = guard.Close() }()
+		ctx = context.WithValue(ctx, xfsCommitKey{}, guard)
+	}
 	return b.s3Backend.CopyObject(ctx, srcBucket, srcKey, dstBucket, dstKey, meta)
 }
 
 func (b *conditionalBackend) CompleteMultipartUpload(ctx context.Context, bucket, object string, uploadID gofakes3.UploadID, input *gofakes3.CompleteMultipartUploadRequest) (gofakes3.VersionID, string, error) {
-	unlock := b.locks.write(objectLockKey(bucket, object))
+	unlock, err := b.locks.lock(ctx, b.objectLockKey(ctx, bucket, object), writeWeight)
+	if err != nil {
+		return "", "", err
+	}
 	defer unlock()
 	v, err := b.s.getVFS(ctx)
 	if err != nil {
@@ -172,6 +194,9 @@ func (b *conditionalBackend) CompleteMultipartUpload(ctx context.Context, bucket
 	if err != nil {
 		return "", "", err
 	}
-	defer func() { _ = guard.close() }()
+	if guard != nil {
+		defer func() { _ = guard.Close() }()
+		ctx = context.WithValue(ctx, xfsCommitKey{}, guard)
+	}
 	return b.s3Backend.CompleteMultipartUpload(ctx, bucket, object, uploadID, input)
 }

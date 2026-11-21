@@ -21,3 +21,6 @@ func StartXFSCommit(target *os.File) (*XFSCommitToken, error) {
 func CommitXFSRange(target, staging *os.File, token *XFSCommitToken, dsync bool) error {
 	return ErrXFSCommitRangeUnsupported
 }
+
+// SupportsXFSExchange reports false on platforms without the supported Linux XFS API.
+func SupportsXFSExchange(path string) (bool, error) { return false, nil }

@@ -18,11 +18,11 @@ import (
 func TestConditionalPutMissingIfMatch(t *testing.T) {
 	b, _ := newTestBackend(t)
 	cb := newConditionalBackend(b)
-	ctx, conditions := conditionalContext(`"missing"`, "")
+	ctx := conditionalContext(`"missing"`, "")
 
 	_, err := cb.PutObject(ctx, "bucket", "missing.txt", map[string]string{}, strings.NewReader("x"), 1)
 	assert.True(t, gofakes3.HasErrorCode(err, gofakes3.ErrNoSuchKey), "got %v", err)
-	assert.False(t, conditions.failed)
+
 }
 
 func TestConditionalCopyObject(t *testing.T) {
@@ -38,42 +38,41 @@ func TestConditionalCopyObject(t *testing.T) {
 	fileName := filepath.Join(root, "bucket", destination)
 
 	t.Run("StaleIfMatch", func(t *testing.T) {
-		conditionalCtx, conditions := conditionalContext(`"stale"`, "")
+		conditionalCtx := conditionalContext(`"stale"`, "")
 		_, err := cb.CopyObject(conditionalCtx, "bucket", "object.txt", "bucket", destination, map[string]string{})
-		assert.ErrorIs(t, err, errPreconditionFailed)
-		assert.True(t, conditions.failed)
+		assert.ErrorIs(t, err, gofakes3.ErrPreconditionFailed)
+
 		got, readErr := os.ReadFile(fileName)
 		require.NoError(t, readErr)
 		assert.Equal(t, original, string(got))
 	})
 
 	t.Run("MatchingIfMatch", func(t *testing.T) {
-		conditionalCtx, conditions := conditionalContext(oldETag, "")
+		conditionalCtx := conditionalContext(oldETag, "")
 		_, err := cb.CopyObject(conditionalCtx, "bucket", "object.txt", "bucket", destination, map[string]string{})
 		require.NoError(t, err)
-		assert.False(t, conditions.failed)
+
 		got, readErr := os.ReadFile(fileName)
 		require.NoError(t, readErr)
 		assert.Equal(t, "normal object", string(got))
 	})
 
 	t.Run("IfNoneMatchCreateOnly", func(t *testing.T) {
-		conditionalCtx, conditions := conditionalContext("", "*")
+		conditionalCtx := conditionalContext("", "*")
 		_, err := cb.CopyObject(conditionalCtx, "bucket", "object.txt", "bucket", "copy-new.txt", map[string]string{})
 		require.NoError(t, err)
-		assert.False(t, conditions.failed)
 
-		conditionalCtx, conditions = conditionalContext("", "*")
+		conditionalCtx = conditionalContext("", "*")
 		_, err = cb.CopyObject(conditionalCtx, "bucket", "object.txt", "bucket", "copy-new.txt", map[string]string{})
-		assert.ErrorIs(t, err, errPreconditionFailed)
-		assert.True(t, conditions.failed)
+		assert.ErrorIs(t, err, gofakes3.ErrPreconditionFailed)
+
 	})
 }
 
 func TestConditionalHTTP(t *testing.T) {
 	b, root := newTestBackend(t)
 	cb := newConditionalBackend(b)
-	handler := conditionalWriteMiddleware(gofakes3.New(cb, gofakes3.WithHostBucket(false), gofakes3.WithoutVersioning()).Server())
+	handler := gofakes3.New(cb, gofakes3.WithHostBucket(false), gofakes3.WithoutVersioning()).Server()
 	for _, test := range []struct {
 		name, key, match, none, copySource string
 		status                             int
@@ -113,25 +112,6 @@ func TestConditionalHTTP(t *testing.T) {
 	}
 }
 
-func TestConditionalResponseStatus(t *testing.T) {
-	for _, test := range []struct {
-		failed, conflicted bool
-		input, want        int
-	}{
-		{true, false, 500, 412}, {false, true, 500, 409},
-		{false, false, 500, 500}, {true, false, 403, 403},
-		{false, false, 200, 200},
-	} {
-		rec := httptest.NewRecorder()
-		w := conditionalResponseWriter{ResponseWriter: rec, conditions: &writeConditions{failed: test.failed, conflicted: test.conflicted}}
-		w.Header().Set("X-Amz-Request-Id", "preserved")
-		w.WriteHeader(test.input)
-		assert.Equal(t, test.want, rec.Code)
-		assert.Equal(t, "preserved", rec.Header().Get("X-Amz-Request-Id"))
-		assert.Same(t, rec, w.Unwrap())
-	}
-}
-
 func TestConditionalMultipart(t *testing.T) {
 	b, root := newTestBackend(t)
 	cb := newConditionalBackend(b)
@@ -143,13 +123,13 @@ func TestConditionalMultipart(t *testing.T) {
 	require.NoError(t, err)
 	var input gofakes3.CompleteMultipartUploadRequest
 	require.NoError(t, xml.Unmarshal([]byte(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>`+partETag+`</ETag></Part></CompleteMultipartUpload>`), &input))
-	conditional, _ := conditionalContext(`"stale"`, "")
+	conditional := conditionalContext(`"stale"`, "")
 	_, _, err = cb.CompleteMultipartUpload(conditional, "bucket", "object.txt", id, &input)
-	require.ErrorIs(t, err, errPreconditionFailed)
+	require.ErrorIs(t, err, gofakes3.ErrPreconditionFailed)
 	got, err := os.ReadFile(filepath.Join(root, "bucket", "object.txt"))
 	require.NoError(t, err)
 	assert.Equal(t, "normal object", string(got))
-	conditional, _ = conditionalContext(etag, "")
+	conditional = conditionalContext(etag, "")
 	_, _, err = cb.CompleteMultipartUpload(conditional, "bucket", "other.txt", id, &input)
 	require.Equal(t, gofakes3.ErrNoSuchUpload, err)
 	_, _, err = cb.CompleteMultipartUpload(conditional, "bucket", "object.txt", id, &input)
@@ -175,11 +155,13 @@ func TestConditionalDeleteMultiDuplicate(t *testing.T) {
 
 func TestKeyedRWMutexZeroValue(t *testing.T) {
 	var locks keyedRWMutex
-	unlock := locks.write("one")
+	unlock, err := locks.lock(context.Background(), "one", writeWeight)
+	require.NoError(t, err)
 	assert.Len(t, locks.locks, 1)
 	unlock()
 	assert.Empty(t, locks.locks)
-	unlock = locks.read("one")
+	unlock, err = locks.lock(context.Background(), "one", 1)
+	require.NoError(t, err)
 	unlock()
 	assert.Empty(t, locks.locks)
 }

@@ -51,6 +51,39 @@ func IsXFS(path string) (bool, error) {
 	return uint64(st.Type) == xfsSuperMagic, nil
 }
 
+// xfsGeometry contains the flags field of struct xfs_fsop_geom.
+type xfsGeometry struct {
+	_     [92]byte
+	Flags uint32
+	_     [160]byte
+}
+
+const xfsIOCGeometry = uintptr(0x8100587e)
+const xfsGeometryExchangeRange = 1 << 24
+
+// SupportsXFSExchange checks the exchange-range bit in the filesystem geometry.
+func SupportsXFSExchange(path string) (bool, error) {
+	onXFS, err := IsXFS(path)
+	if !onXFS || err != nil {
+		return false, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	var geo xfsGeometry
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), xfsIOCGeometry, uintptr(unsafe.Pointer(&geo)))
+	runtime.KeepAlive(f)
+	if isXFSCommitUnsupported(errno) {
+		return false, nil
+	}
+	if errno != 0 {
+		return false, errno
+	}
+	return geo.Flags&xfsGeometryExchangeRange != 0, nil
+}
+
 // StartXFSCommit samples the target file's freshness information for a later
 // conditional range commit.
 func StartXFSCommit(target *os.File) (*XFSCommitToken, error) {

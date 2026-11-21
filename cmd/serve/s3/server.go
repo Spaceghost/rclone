@@ -104,7 +104,7 @@ func newServer(ctx context.Context, f fs.Fs, opt *Options, vfsOpt *vfscommon.Opt
 		gofakes3.WithIntegrityCheck(true), // Check Content-MD5 if supplied
 	)
 
-	w.handler = conditionalWriteMiddleware(w.faker.Server())
+	w.handler = w.faker.Server()
 
 	if w.provider.IsProxy() {
 		w.handler = proxyAuthMiddleware(w.handler, w)

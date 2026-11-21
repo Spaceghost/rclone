@@ -3,6 +3,7 @@ package s3
 import (
 	"errors"
 
+	"github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/operations"
 	filelib "github.com/rclone/rclone/lib/file"
@@ -10,23 +11,20 @@ import (
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
-type localPathProvider interface {
-	LocalPath(remote string) (string, error)
-}
-
 func xfsCommitRangeCapability(fsys fs.Fs) (bool, error) {
-	local, ok := fsys.(localPathProvider)
+	f, ok := fsys.(*local.Fs)
 	if !ok {
 		return false, nil
 	}
-	root, err := local.LocalPath("")
-	if errors.Is(err, fs.ErrorNotImplemented) {
-		return false, nil
+	return f.SupportsXFSExchange()
+}
+
+func startXFSCommitGuard(fsys fs.Fs, remote string) (*local.XFSCommit, error) {
+	f, ok := fsys.(*local.Fs)
+	if !ok {
+		return nil, filelib.ErrXFSCommitRangeUnsupported
 	}
-	if err != nil {
-		return false, err
-	}
-	return filelib.IsXFS(root)
+	return f.StartXFSCommit(remote)
 }
 
 func xfsCommitRangeVFSCapability(v *vfs.VFS) (bool, error) {

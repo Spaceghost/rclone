@@ -286,3 +286,5 @@ require (
 	golang.org/x/mobile v0.0.0-20260709172247-6129f5bee9d5
 	golang.org/x/term v0.45.0
 )
+
+replace github.com/rclone/gofakes3 => github.com/Spaceghost/gofakes3 v0.0.10-0.20261121162449-5dde3bef5bed
