@@ -44,6 +44,7 @@ type s3Backend struct {
 	// multipartUploads tracks in-flight streaming multipart uploads,
 	// keyed by gofakes3.UploadID.
 	multipartUploads sync.Map
+	multipartETags   sync.Map // multipartTagKey to multipartTag
 
 	// warnInMemoryOnce logs a single NOTICE the first time a multipart
 	// upload falls back to being buffered in memory.
@@ -183,6 +184,7 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
 	return &gofakes3.Object{
 		Name:     objectName,
 		Hash:     hash,
+		ETag:     b.multipartTagFor(_vfs, node.Path(), hex.EncodeToString(hash)),
 		Metadata: meta,
 		Size:     size,
 		Contents: noOpReadCloser{},
@@ -264,6 +266,7 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 	return &gofakes3.Object{
 		Name:     objectName,
 		Hash:     hash,
+		ETag:     b.multipartTagFor(_vfs, node.Path(), hex.EncodeToString(hash)),
 		Metadata: meta,
 		Size:     size,
 		Range:    rnge,
@@ -412,17 +415,18 @@ func (b *s3Backend) PutObject(
 
 	// Rename the temporary object into place
 	if tmpFp != fp {
-		if err := _vfs.Rename(tmpFp, fp); err != nil {
+		if err := b.publishObject(ctx, _vfs, tmpFp, fp); err != nil {
 			cleanup()
 			return result, err
 		}
 	}
 
-	_, err = _vfs.Stat(fp)
+	published, err := _vfs.Stat(fp)
 	if err != nil {
 		return result, err
 	}
 
+	b.multipartETags.Delete(multipartTagKey{_vfs, published.Path()})
 	b.meta.Store(fp, meta)
 
 	if val, ok := meta["X-Amz-Meta-Mtime"]; ok {
@@ -492,6 +496,7 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
 		return err
 	}
 
+	b.multipartETags.Delete(multipartTagKey{_vfs, fp})
 	// FIXME: unsafe operation
 	rmdirRecursive(fp, _vfs)
 	return nil
