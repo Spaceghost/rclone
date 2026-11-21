@@ -287,4 +287,4 @@ require (
 	golang.org/x/term v0.45.0
 )
 
-replace github.com/rclone/gofakes3 => github.com/Spaceghost/gofakes3 v0.0.10-0.20261121162449-5dde3bef5bed
+replace github.com/rclone/gofakes3 => github.com/Spaceghost/gofakes3 v0.0.10-0.20261121164039-7c9f34639431

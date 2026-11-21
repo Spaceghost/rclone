@@ -51,10 +51,15 @@ func (b *s3Backend) entryListR(_vfs *vfs.VFS, bucketName, fdPath, name string, a
 				return err
 			}
 		} else {
+			sum := getFileHash(entry, b.s.etagHashType)
+			etag := b.multipartTagFor(_vfs, entry.Path(), sum)
+			if etag == "" {
+				etag = sum
+			}
 			item := &gofakes3.Content{
 				Key:          objectPath,
 				LastModified: gofakes3.NewContentTime(entry.ModTime()),
-				ETag:         getFileHash(entry, b.s.etagHashType),
+				ETag:         etag,
 				Size:         entry.Size(),
 				StorageClass: gofakes3.StorageStandard,
 			}

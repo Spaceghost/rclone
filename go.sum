@@ -55,8 +55,8 @@ github.com/PuerkitoBio/goquery v1.12.0 h1:pAcL4g3WRXekcB9AU/y1mbKez2dbY2AajVhtkO
 github.com/PuerkitoBio/goquery v1.12.0/go.mod h1:802ej+gV2y7bbIhOIoPY5sT183ZW0YFofScC4q/hIpQ=
 github.com/STARRY-S/zip v0.2.3 h1:luE4dMvRPDOWQdeDdUxUoZkzUIpTccdKdhHHsQJ1fm4=
 github.com/STARRY-S/zip v0.2.3/go.mod h1:lqJ9JdeRipyOQJrYSOtpNAiaesFO6zVDsE8GIGFaoSk=
-github.com/Spaceghost/gofakes3 v0.0.10-0.20261121162449-5dde3bef5bed h1:osQ6rL+OPaC6lv1VzV0efAQiaSnXtaD/SEWDwq8sxtU=
-github.com/Spaceghost/gofakes3 v0.0.10-0.20261121162449-5dde3bef5bed/go.mod h1:0udb2hmIO9mHXDAgcdycCzSPPASAGIz410t+m0LKmnE=
+github.com/Spaceghost/gofakes3 v0.0.10-0.20261121164039-7c9f34639431 h1:M4hu1OUNl/SKDdrPMrQOwaFKvsWqs0GrA48TOgUqrR0=
+github.com/Spaceghost/gofakes3 v0.0.10-0.20261121164039-7c9f34639431/go.mod h1:0udb2hmIO9mHXDAgcdycCzSPPASAGIz410t+m0LKmnE=
 github.com/a1ex3/zstd-seekable-format-go/pkg v0.10.0 h1:iLDOF0rdGTrol/q8OfPIIs5kLD8XvA2q75o6Uq/tgak=
 github.com/a1ex3/zstd-seekable-format-go/pkg v0.10.0/go.mod h1:DrEWcQJjz7t5iF2duaiyhg4jyoF0kxOD6LtECNGkZ/Q=
 github.com/a8m/tree v0.0.0-20240104212747-2c8764a5f17e h1:KMVieI1/Ub++GYfnhyFPoGE3g5TUiG4srE3TMGr5nM4=

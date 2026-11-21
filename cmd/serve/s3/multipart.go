@@ -33,6 +33,7 @@ import (
 	"github.com/ncw/swift/v2"
 	"github.com/rclone/gofakes3"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/pool"
@@ -57,20 +58,39 @@ type multipartUpload struct {
 	fh  io.WriteCloser // sink the in-order parts are written to
 	vfs *vfs.VFS       // the VFS fh was created on, used for all later operations
 
-	mu        sync.Mutex
-	cond      *sync.Cond     // signalled when buffered shrinks, nextPart advances or the upload closes
-	partMD5s  map[int][]byte // raw MD5 sums per part (for the final S3 multipart ETag)
-	partSizes map[int]int64  // observed part sizes
-	closed    bool
-	aborted   bool      // closed by abort, so nothing was committed
-	active    int       // requests in flight for this upload, protecting it from the reaper
-	lastUsed  time.Time // when the last request for this upload finished
+	mu          sync.Mutex
+	cond        *sync.Cond // signalled when buffered shrinks, nextPart advances or the upload closes
+	contentHash *hash.MultiHasher
+	partMD5s    map[int][]byte // raw MD5 sums per part (for the final S3 multipart ETag)
+	partSizes   map[int]int64  // observed part sizes
+	closed      bool
+	aborted     bool      // closed by abort, so nothing was committed
+	active      int       // requests in flight for this upload, protecting it from the reaper
+	lastUsed    time.Time // when the last request for this upload finished
 
 	nextPart    int              // next part number to stream (1-based)
 	streamBuf   map[int]*pool.RW // parts received ahead of nextPart, awaiting their turn
 	pumping     bool             // a goroutine is currently writing to the sink
 	buffered    int64            // bytes of parts admitted but not yet streamed or released
 	bufferLimit int64            // max buffered before parts ahead of nextPart must wait (<= 0 for no limit)
+}
+
+type multipartTagKey struct {
+	vfs  *vfs.VFS
+	path string
+}
+type multipartTag struct{ sum, etag string }
+
+// multipartTagFor recognizes a completed upload only while its content hash matches.
+func (b *s3Backend) multipartTagFor(v *vfs.VFS, path, sum string) string {
+	key := multipartTagKey{v, path}
+	if value, ok := b.multipartETags.Load(key); ok && sum != "" {
+		tag := value.(multipartTag)
+		if tag.sum == sum {
+			return tag.etag
+		}
+	}
+	return ""
 }
 
 // newMultipartUpload allocates an upload struct.
@@ -92,19 +112,23 @@ func newMultipartUpload(bucket, key, fp, streamFp string, meta map[string]string
 	return up
 }
 
-// startActivity marks the upload as having a request in flight.
-func (up *multipartUpload) startActivity() {
-	up.mu.Lock()
-	up.active++
-	up.mu.Unlock()
-}
-
 // endActivity marks the request done and restarts the upload's idle time.
 func (up *multipartUpload) endActivity() {
 	up.mu.Lock()
 	up.active--
 	up.lastUsed = time.Now()
 	up.mu.Unlock()
+}
+
+// acquireUploadActivity pins an upload unless the reaper has already removed it.
+func (b *s3Backend) acquireUploadActivity(up *multipartUpload, id gofakes3.UploadID) bool {
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if current, ok := b.multipartUploads.Load(id); !ok || current != up {
+		return false
+	}
+	up.active++
+	return true
 }
 
 // loadUpload looks up an in-flight upload by ID.
@@ -159,6 +183,12 @@ func (b *s3Backend) CreateMultipartUpload(ctx context.Context, bucketName, objec
 	uploadID := gofakes3.UploadID(uuid.New().String())
 	streamFp := path.Join(objectDir, multipartUploadPrefix+string(uploadID))
 	up := newMultipartUpload(bucketName, objectName, fp, streamFp, meta, int64(b.s.opt.MultipartStreamingBufferLimit))
+	if ht := b.s.etagHashType; ht != hash.None {
+		up.contentHash, err = hash.NewMultiHasherTypes(hash.NewHashSet(ht))
+		if err != nil {
+			return "", err
+		}
+	}
 	fh, err := _vfs.Create(streamFp)
 	if err != nil {
 		return "", err
@@ -176,7 +206,9 @@ func (b *s3Backend) UploadPart(ctx context.Context, bucketName, objectName strin
 	if err != nil {
 		return "", err
 	}
-	up.startActivity()
+	if !b.acquireUploadActivity(up, uploadID) {
+		return "", gofakes3.ErrNoSuchUpload
+	}
 	defer up.endActivity()
 
 	// Wait until there is room to buffer this part, bounding the memory a
@@ -323,7 +355,11 @@ func (up *multipartUpload) streamPart(partNumber int, size int64, md5Sum []byte,
 		psize := prw.Size()
 		up.mu.Unlock()
 
-		err := pipePart(up.fh, prw)
+		var sink io.Writer = up.fh
+		if up.contentHash != nil {
+			sink = io.MultiWriter(sink, up.contentHash)
+		}
+		err := pipePart(sink, prw)
 		_ = prw.Close()
 		if err != nil {
 			up.mu.Lock()
@@ -366,9 +402,14 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, obj
 	if err != nil {
 		return "", "", err
 	}
-	up.startActivity()
+	if !b.acquireUploadActivity(up, uploadID) {
+		return "", "", gofakes3.ErrNoSuchUpload
+	}
 	defer up.endActivity()
+	return b.completeMultipartUpload(ctx, up, uploadID, input)
+}
 
+func (b *s3Backend) completeMultipartUpload(ctx context.Context, up *multipartUpload, uploadID gofakes3.UploadID, input *gofakes3.CompleteMultipartUploadRequest) (gofakes3.VersionID, string, error) {
 	if err := up.validate(input); err != nil {
 		b.multipartUploads.Delete(uploadID)
 		_ = up.abort()
@@ -404,7 +445,12 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, obj
 		}
 	}
 
-	return "", up.multipartETag(input), nil
+	etag := up.multipartETag(input)
+	if node, err := up.vfs.Stat(up.fp); err == nil && up.contentHash != nil {
+		key := multipartTagKey{up.vfs, node.Path()}
+		b.multipartETags.Store(key, multipartTag{up.contentHash.Sums()[b.s.etagHashType], etag})
+	}
+	return "", etag, nil
 }
 
 // publishMultipartUpload moves the staged object into place when possible,
@@ -428,11 +474,14 @@ func (b *s3Backend) publishMultipartUpload(ctx context.Context, up *multipartUpl
 		return putErr
 	}
 	if closeErr != nil {
-		return closeErr
+		fs.Errorf(up.streamFp, "Failed to close published staging object: %v", closeErr)
 	}
 
 	b.forgetPath(up.vfs, up.streamFp)
-	return up.vfs.Remove(up.streamFp)
+	if err := up.vfs.Remove(up.streamFp); err != nil {
+		fs.Errorf(up.streamFp, "Failed to remove published staging object: %v", err)
+	}
+	return nil
 }
 
 // AbortMultipartUpload tears down an in-progress upload, discarding any data
@@ -482,13 +531,12 @@ func (b *s3Backend) reapExpiredUploads(now time.Time, expiry time.Duration) {
 		uploadID := key.(gofakes3.UploadID)
 		up := value.(*multipartUpload)
 		up.mu.Lock()
-		expired := up.active == 0 && now.Sub(up.lastUsed) >= expiry
+		expired := up.active == 0 && now.Sub(up.lastUsed) >= expiry && b.multipartUploads.CompareAndDelete(uploadID, up)
 		up.mu.Unlock()
 		if !expired {
 			return true
 		}
 		fs.Logf(up.fp, "aborting multipart upload %s idle for more than %v", uploadID, expiry)
-		b.multipartUploads.Delete(uploadID)
 		if err := up.abort(); err != nil {
 			fs.Errorf(up.fp, "aborting abandoned multipart upload: %v", err)
 		}

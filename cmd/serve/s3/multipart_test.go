@@ -675,7 +675,7 @@ func TestMultipartReapExpiredUploads(t *testing.T) {
 	newUp("fresh")
 	idle := newUp("idle")
 	busy := newUp("busy")
-	busy.startActivity()
+	require.True(t, b.acquireUploadActivity(busy, "busy"))
 	for _, up := range []*multipartUpload{idle, busy} {
 		up.mu.Lock()
 		up.lastUsed = now.Add(-2 * expiry)

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v7"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -212,4 +214,52 @@ func TestConditionalClientRace(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestConditionalDirtyOverwrite(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeWrites
+	opt.WriteBack = fs.Duration(time.Hour)
+	core, f, bucket := newMultipartTestServerVFS(t, ":memory,description="+fmt.Sprint(time.Now().UnixNano())+":", false, nil, &opt, "Copy")
+	ctx := context.Background()
+	_, err := f.Put(ctx, strings.NewReader("old"), object.NewStaticObjectInfo(bucket+"/key", time.Now(), 3, true, nil, f))
+	require.NoError(t, err)
+	old, err := core.StatObject(ctx, bucket, "key", minio.StatObjectOptions{})
+	require.NoError(t, err)
+	put := minio.PutObjectOptions{}
+	put.SetMatchETag(old.ETag)
+	_, err = core.PutObject(ctx, bucket, "key", strings.NewReader("new"), 3, "", "", put)
+	require.NoError(t, err)
+	_, err = core.PutObject(ctx, bucket, "key", strings.NewReader("bad"), 3, "", "", put)
+	require.Equal(t, 412, minio.ToErrorResponse(err).StatusCode)
+}
+
+func TestConditionalMultipartValidator(t *testing.T) {
+	core, _, bucket := newMultipartTestServer(t, false)
+	ctx := context.Background()
+	id, err := core.NewMultipartUpload(ctx, bucket, "key", minio.PutObjectOptions{})
+	require.NoError(t, err)
+	part, err := core.PutObjectPart(ctx, bucket, "key", id, 1, strings.NewReader("new"), 3, minio.PutObjectPartOptions{})
+	require.NoError(t, err)
+	result, err := core.CompleteMultipartUpload(ctx, bucket, "key", id, []minio.CompletePart{{PartNumber: 1, ETag: part.ETag}}, minio.PutObjectOptions{})
+	require.NoError(t, err)
+	require.Contains(t, result.ETag, "-1")
+	info, err := core.StatObject(ctx, bucket, "key", minio.StatObjectOptions{})
+	require.NoError(t, err)
+	require.Equal(t, result.ETag, info.ETag)
+	r, info, _, err := core.GetObject(ctx, bucket, "key", minio.GetObjectOptions{})
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	require.Equal(t, result.ETag, info.ETag)
+	put := minio.PutObjectOptions{}
+	put.SetMatchETagExcept(info.ETag)
+	_, err = core.PutObject(ctx, bucket, "key", strings.NewReader("bad"), 3, "", "", put)
+	require.Equal(t, 412, minio.ToErrorResponse(err).StatusCode)
+	put = minio.PutObjectOptions{}
+	put.SetMatchETag(info.ETag)
+	_, err = core.PutObject(ctx, bucket, "key", strings.NewReader("new"), 3, "", "", put)
+	require.NoError(t, err)
+	info, err = core.StatObject(ctx, bucket, "key", minio.StatObjectOptions{})
+	require.NoError(t, err)
+	require.NotEqual(t, result.ETag, info.ETag)
 }

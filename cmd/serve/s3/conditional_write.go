@@ -66,7 +66,10 @@ func (b *conditionalBackend) checkConditions(ctx context.Context, v *vfs.VFS, bu
 		if sum == "" {
 			return true, gofakes3.ErrInternal
 		}
-		etag = `"` + sum + `"`
+		etag = b.multipartTagFor(v, node.Path(), sum)
+		if etag == "" {
+			etag = `"` + sum + `"`
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return exists, err
@@ -174,11 +177,6 @@ func (b *conditionalBackend) CopyObject(ctx context.Context, srcBucket, srcKey, 
 }
 
 func (b *conditionalBackend) CompleteMultipartUpload(ctx context.Context, bucket, object string, uploadID gofakes3.UploadID, input *gofakes3.CompleteMultipartUploadRequest) (gofakes3.VersionID, string, error) {
-	unlock, err := b.locks.lock(ctx, b.objectLockKey(ctx, bucket, object), writeWeight)
-	if err != nil {
-		return "", "", err
-	}
-	defer unlock()
 	v, err := b.s.getVFS(ctx)
 	if err != nil {
 		return "", "", err
@@ -190,6 +188,19 @@ func (b *conditionalBackend) CompleteMultipartUpload(ctx context.Context, bucket
 	if up.bucket != bucket || up.key != object || up.vfs != v {
 		return "", "", gofakes3.ErrNoSuchUpload
 	}
+	if !b.acquireUploadActivity(up, uploadID) {
+		return "", "", gofakes3.ErrNoSuchUpload
+	}
+	defer up.endActivity()
+	unlock, err := b.locks.lock(ctx, b.objectLockKey(ctx, bucket, object), writeWeight)
+	if err != nil {
+		return "", "", err
+	}
+	defer unlock()
+	// An earlier completion or abort may have consumed this upload while we waited.
+	if _, err := b.loadUpload(uploadID); err != nil {
+		return "", "", err
+	}
 	guard, err := b.beginConditionalWrite(ctx, v, bucket, object)
 	if err != nil {
 		return "", "", err
@@ -198,5 +209,5 @@ func (b *conditionalBackend) CompleteMultipartUpload(ctx context.Context, bucket
 		defer func() { _ = guard.Close() }()
 		ctx = context.WithValue(ctx, xfsCommitKey{}, guard)
 	}
-	return b.s3Backend.CompleteMultipartUpload(ctx, bucket, object, uploadID, input)
+	return b.completeMultipartUpload(ctx, up, uploadID, input)
 }

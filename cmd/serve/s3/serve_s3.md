@@ -385,6 +385,8 @@ Other operations will return error `Unimplemented`.
 PUT, COPY and multipart completion accept `If-Match` and `If-None-Match`.
 Use `If-Match` with the current ETag to replace an unchanged object, or
 `If-None-Match: *` to create an object only when the key is absent.
+For streamed multipart uploads, the server remembers the multipart ETag
+while the content hash matches. After a restart, it uses the backend hash.
 A failed condition returns `412 PreconditionFailed`. A missing object with
 `If-Match` returns `404 NoSuchKey`.
 

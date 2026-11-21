@@ -63,7 +63,8 @@ func readFileHash(ctx context.Context, node any, hashType hash.Type) (string, er
 	switch b := node.(type) {
 	case vfs.Node:
 		fsObj, ok := b.DirEntry().(fs.Object)
-		if !ok {
+		file, isFile := b.(*vfs.File)
+		if !ok || (isFile && file.CacheDirty()) {
 			fs.Debugf("serve s3", "File uploading - reading hash from VFS cache")
 			in, err := b.Open(os.O_RDONLY)
 			if err != nil {
